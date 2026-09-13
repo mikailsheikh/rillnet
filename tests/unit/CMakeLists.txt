@@ -21,6 +21,7 @@ add_executable(rillnet_unit_tests
   write_queue_test.cpp
   client_connection_test.cpp
   server_connection_test.cpp
+  diagnostics_test.cpp
 )
 
 target_link_libraries(rillnet_unit_tests

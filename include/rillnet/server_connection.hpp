@@ -1,6 +1,7 @@
 #pragma once
 
 #include <rillnet/codec.hpp>
+#include <rillnet/diagnostics.hpp>
 #include <rillnet/frame.hpp>
 #include <rillnet/frame_decoder.hpp>
 #include <rillnet/identifiers.hpp>
@@ -67,9 +68,25 @@ template <typename CodecType = PodCodec> class ServerConnection {
   public:
     ServerConnection(boost::asio::any_io_executor executor, std::unique_ptr<Transport> transport,
                      const MessageRegistry<CodecType> &registry,
-                     WriteQueueLimits write_queue_limits = {})
+                     WriteQueueLimits write_queue_limits = {}, DiagnosticsHooks diagnostics = {})
         : executor_(std::move(executor)), transport_(std::move(transport)), registry_(registry),
-          write_queue_(executor_, *transport_, write_queue_limits)
+          write_queue_(executor_, *transport_, write_queue_limits,
+                       [diagnostics](const Frame &frame, std::size_t bytes) mutable {
+                           notify_diagnostics(diagnostics, {DiagnosticsEventType::bytes_transferred,
+                                                            {},
+                                                            StatusCode::ok,
+                                                            bytes,
+                                                            false,
+                                                            {}});
+                           notify_diagnostics(diagnostics,
+                                              {DiagnosticsEventType::message_transferred,
+                                               frame.header.stream,
+                                               StatusCode::ok,
+                                               0,
+                                               false,
+                                               {}});
+                       }),
+          diagnostics_(std::move(diagnostics))
     {
     }
 
@@ -102,6 +119,7 @@ template <typename CodecType = PodCodec> class ServerConnection {
         }
         transport_->close();
         lifecycle_.transition(ConnectionState::closed);
+        notify_closed();
         co_return;
     }
 
@@ -143,6 +161,7 @@ template <typename CodecType = PodCodec> class ServerConnection {
         if (lifecycle_.state() == ConnectionState::created) {
             (void)lifecycle_.transition(ConnectionState::accepting);
             (void)lifecycle_.transition(ConnectionState::active);
+            notify_diagnostics(diagnostics_, {DiagnosticsEventType::connection_opened});
         }
         using namespace boost::asio::experimental::awaitable_operators;
         co_await (write_queue_.run() && read_loop());
@@ -168,14 +187,34 @@ template <typename CodecType = PodCodec> class ServerConnection {
                 connection_lost = !transport_->is_open();
                 break;
             }
+            notify_diagnostics(diagnostics_, {DiagnosticsEventType::bytes_transferred,
+                                              {},
+                                              StatusCode::ok,
+                                              bytes_read,
+                                              true,
+                                              {}});
 
             for (auto &frame : decoder_.push(std::span(buffer).first(bytes_read))) {
+                notify_diagnostics(diagnostics_, {DiagnosticsEventType::message_transferred,
+                                                  frame.header.stream,
+                                                  StatusCode::ok,
+                                                  0,
+                                                  true,
+                                                  {}});
                 dispatch(std::move(frame));
                 if (!transport_->is_open()) {
                     break;
                 }
             }
             if (decoder_.error().has_value()) {
+                const auto error = *decoder_.error();
+                const auto status = status_for_frame_validation(error);
+                notify_diagnostics(diagnostics_, {DiagnosticsEventType::protocol_error,
+                                                  {},
+                                                  status,
+                                                  0,
+                                                  true,
+                                                  std::string(frame_validation_message(error))});
                 transport_->close();
                 break;
             }
@@ -185,6 +224,8 @@ template <typename CodecType = PodCodec> class ServerConnection {
         }
         reading_ = false;
         close_queue_when_idle();
+        lifecycle_.transition(ConnectionState::closed);
+        notify_closed();
     }
 
     void fail_operations_on_connection_close()
@@ -207,12 +248,12 @@ template <typename CodecType = PodCodec> class ServerConnection {
             return;
         }
         if (frame.header.type != FrameType::request) {
-            transport_->close();
+            fail_connection(StatusCode::malformed_frame, "server received a non-request frame");
             return;
         }
 
         if (terminal_streams_.contains(frame.header.stream)) {
-            transport_->close();
+            fail_connection(StatusCode::malformed_frame, "duplicate terminal frame");
             return;
         }
 
@@ -222,7 +263,7 @@ template <typename CodecType = PodCodec> class ServerConnection {
                 (void)found->second->cancel("operation cancelled by peer");
                 mark_terminal(frame);
             } else {
-                transport_->close();
+                fail_connection(StatusCode::unknown_stream, "cancellation for an unknown stream");
             }
             return;
         }
@@ -241,12 +282,25 @@ template <typename CodecType = PodCodec> class ServerConnection {
         }
 
         auto operation = std::make_shared<Operation>(frame.header.stream);
+        operation->set_completion_handler(
+            [diagnostics = diagnostics_,
+             stream = frame.header.stream](const OperationResult &result) {
+                const auto type = result.status() == StatusCode::cancelled
+                                      ? DiagnosticsEventType::cancellation
+                                  : result.status() == StatusCode::timeout_error
+                                      ? DiagnosticsEventType::timeout
+                                      : DiagnosticsEventType::request_completed;
+                notify_diagnostics(diagnostics,
+                                   {type, stream, result.status(), 0, false, result.message()});
+            });
         (void)operation->activate();
         const auto [inserted, did_insert] = operations_.emplace(frame.header.stream, operation);
         if (!did_insert) {
             transport_->close();
             return;
         }
+        notify_diagnostics(diagnostics_,
+                           {DiagnosticsEventType::request_started, frame.header.stream});
 
         ++active_handlers_;
         boost::asio::co_spawn(executor_,
@@ -286,6 +340,29 @@ template <typename CodecType = PodCodec> class ServerConnection {
         }
     }
 
+    void fail_connection(StatusCode status, std::string message)
+    {
+        if (status_category(status) == StatusCategory::protocol) {
+            notify_diagnostics(
+                diagnostics_, {DiagnosticsEventType::protocol_error, {}, status, 0, true, message});
+        }
+        transport_->close();
+    }
+
+    void notify_closed()
+    {
+        if (closed_notified_) {
+            return;
+        }
+        closed_notified_ = true;
+        notify_diagnostics(diagnostics_, {DiagnosticsEventType::connection_closed,
+                                          {},
+                                          StatusCode::connection_closed,
+                                          0,
+                                          false,
+                                          "connection closed"});
+    }
+
     void begin_shutdown() noexcept
     {
         if (lifecycle_.state() == ConnectionState::created) {
@@ -308,6 +385,8 @@ template <typename CodecType = PodCodec> class ServerConnection {
     std::size_t active_handlers_ = 0;
     bool reading_ = true;
     ConnectionLifecycle lifecycle_;
+    DiagnosticsHooks diagnostics_;
+    bool closed_notified_ = false;
 };
 
 } // namespace rillnet

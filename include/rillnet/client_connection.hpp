@@ -1,6 +1,7 @@
 #pragma once
 
 #include <rillnet/codec.hpp>
+#include <rillnet/diagnostics.hpp>
 #include <rillnet/frame.hpp>
 #include <rillnet/frame_decoder.hpp>
 #include <rillnet/frame_flags.hpp>
@@ -50,8 +51,10 @@ template <typename CodecType = PodCodec> class ClientConnection {
         boost::asio::experimental::channel<void(boost::system::error_code, Frame)>;
 
     struct PendingRequest {
-        PendingRequest(boost::asio::any_io_executor executor, StreamId stream)
-            : channel(executor, 1), timer(executor), operation(stream)
+        PendingRequest(boost::asio::any_io_executor executor, StreamId stream,
+                       Operation::CompletionHandler completion_handler)
+            : channel(executor, 1), timer(executor),
+              operation(stream, std::move(completion_handler))
         {
             (void)operation.activate();
         }
@@ -170,10 +173,27 @@ template <typename CodecType = PodCodec> class ClientConnection {
     ClientConnection(boost::asio::any_io_executor executor, std::unique_ptr<Transport> transport,
                      const MessageRegistry<CodecType> &registry,
                      WriteQueueLimits write_queue_limits = {},
-                     std::uint64_t maximum_stream_id = std::numeric_limits<std::uint64_t>::max())
+                     std::uint64_t maximum_stream_id = std::numeric_limits<std::uint64_t>::max(),
+                     DiagnosticsHooks diagnostics = {})
         : executor_(std::move(executor)), transport_(std::move(transport)), registry_(registry),
-          write_queue_(executor_, *transport_, write_queue_limits),
-          stream_ids_(StreamInitiator::client, maximum_stream_id)
+          write_queue_(executor_, *transport_, write_queue_limits,
+                       [diagnostics](const Frame &frame, std::size_t bytes) mutable {
+                           notify_diagnostics(diagnostics, {DiagnosticsEventType::bytes_transferred,
+                                                            {},
+                                                            StatusCode::ok,
+                                                            bytes,
+                                                            false,
+                                                            {}});
+                           notify_diagnostics(diagnostics,
+                                              {DiagnosticsEventType::message_transferred,
+                                               frame.header.stream,
+                                               StatusCode::ok,
+                                               0,
+                                               false,
+                                               {}});
+                       }),
+          stream_ids_(StreamInitiator::client, maximum_stream_id),
+          diagnostics_(std::move(diagnostics))
     {
     }
 
@@ -206,6 +226,7 @@ template <typename CodecType = PodCodec> class ClientConnection {
         }
         transport_->close();
         lifecycle_.transition(ConnectionState::closed);
+        notify_closed();
         co_return;
     }
 
@@ -217,6 +238,7 @@ template <typename CodecType = PodCodec> class ClientConnection {
         if (lifecycle_.state() == ConnectionState::created) {
             (void)lifecycle_.transition(ConnectionState::connecting);
             (void)lifecycle_.transition(ConnectionState::active);
+            notify_diagnostics(diagnostics_, {DiagnosticsEventType::connection_opened});
         }
         using namespace boost::asio::experimental::awaitable_operators;
         co_await (write_queue_.run() && read_loop());
@@ -287,8 +309,18 @@ template <typename CodecType = PodCodec> class ClientConnection {
             co_return StartRequestResult<Response>::failure(encoded.status, encoded.message);
         }
 
-        auto pending = std::make_shared<PendingRequest>(executor_, stream);
+        auto pending = std::make_shared<PendingRequest>(
+            executor_, stream, [diagnostics = diagnostics_, stream](const OperationResult &result) {
+                const auto type = result.status() == StatusCode::cancelled
+                                      ? DiagnosticsEventType::cancellation
+                                  : result.status() == StatusCode::timeout_error
+                                      ? DiagnosticsEventType::timeout
+                                      : DiagnosticsEventType::request_completed;
+                notify_diagnostics(diagnostics,
+                                   {type, stream, result.status(), 0, false, result.message()});
+            });
         pending_.emplace(stream, pending);
+        notify_diagnostics(diagnostics_, {DiagnosticsEventType::request_started, stream});
 
         const auto sent = co_await write_queue_.enqueue(std::move(*encoded.frame));
         if (!sent.ok()) {
@@ -346,8 +378,20 @@ template <typename CodecType = PodCodec> class ClientConnection {
                 // A zero-length read means the peer closed the connection, mirroring socket EOF.
                 break;
             }
+            notify_diagnostics(diagnostics_, {DiagnosticsEventType::bytes_transferred,
+                                              {},
+                                              StatusCode::ok,
+                                              bytes_read,
+                                              true,
+                                              {}});
 
             for (auto &frame : decoder_.push(std::span(buffer).first(bytes_read))) {
+                notify_diagnostics(diagnostics_, {DiagnosticsEventType::message_transferred,
+                                                  frame.header.stream,
+                                                  StatusCode::ok,
+                                                  0,
+                                                  true,
+                                                  {}});
                 dispatch(std::move(frame));
                 if (!transport_->is_open()) {
                     break;
@@ -364,6 +408,7 @@ template <typename CodecType = PodCodec> class ClientConnection {
         fail_pending(StatusCode::connection_closed, "connection closed while awaiting a response");
         write_queue_.close();
         lifecycle_.transition(ConnectionState::closed);
+        notify_closed();
     }
 
     void dispatch(Frame frame)
@@ -419,6 +464,10 @@ template <typename CodecType = PodCodec> class ClientConnection {
 
     void fail_connection(StatusCode status, std::string message)
     {
+        if (status_category(status) == StatusCategory::protocol) {
+            notify_diagnostics(
+                diagnostics_, {DiagnosticsEventType::protocol_error, {}, status, 0, true, message});
+        }
         fail_pending(status, std::move(message));
         transport_->close();
     }
@@ -507,6 +556,20 @@ template <typename CodecType = PodCodec> class ClientConnection {
         (void)write_queue_.try_enqueue(std::move(frame));
     }
 
+    void notify_closed()
+    {
+        if (closed_notified_) {
+            return;
+        }
+        closed_notified_ = true;
+        notify_diagnostics(diagnostics_, {DiagnosticsEventType::connection_closed,
+                                          {},
+                                          StatusCode::connection_closed,
+                                          0,
+                                          false,
+                                          "connection closed"});
+    }
+
     boost::asio::any_io_executor executor_;
     std::unique_ptr<Transport> transport_;
     const MessageRegistry<CodecType> &registry_;
@@ -516,6 +579,8 @@ template <typename CodecType = PodCodec> class ClientConnection {
     std::unordered_map<StreamId, std::shared_ptr<PendingRequest>> pending_;
     std::unordered_set<StreamId> terminal_streams_;
     ConnectionLifecycle lifecycle_;
+    DiagnosticsHooks diagnostics_;
+    bool closed_notified_ = false;
 };
 
 } // namespace rillnet

@@ -90,6 +90,11 @@ class Operation {
         return true;
     }
 
+    void set_completion_handler(CompletionHandler completion_handler) noexcept
+    {
+        completion_handler_ = std::move(completion_handler);
+    }
+
     [[nodiscard]] bool complete(std::string message = {})
     {
         return finish(OperationState::completed, OperationResult::success(std::move(message)));

@@ -53,13 +53,15 @@ struct WriteQueueLimits {
 // capacity.
 class WriteQueue {
   public:
+    using WriteObserver = std::function<void(const Frame &, std::size_t)>;
     // Effectively unbounded: large enough that enqueue() never blocks on capacity in practice.
     static constexpr std::size_t unbounded_capacity = (std::numeric_limits<std::size_t>::max)();
 
     explicit WriteQueue(boost::asio::any_io_executor executor, Transport &transport,
-                        WriteQueueLimits limits = {})
+                        WriteQueueLimits limits = {}, WriteObserver write_observer = {})
         : transport_(transport), limits_(limits), channel_(executor, limits.max_frames),
-          space_channel_(std::move(executor), space_signal_capacity(limits))
+          space_channel_(std::move(executor), space_signal_capacity(limits)),
+          write_observer_(std::move(write_observer))
     {
     }
 
@@ -129,6 +131,9 @@ class WriteQueue {
             try {
                 const auto encoded = encode_frame(frame);
                 co_await transport_.write(encoded);
+                if (write_observer_) {
+                    write_observer_(frame, encoded.size());
+                }
             } catch (const boost::system::system_error &write_error) {
                 close();
                 transport_.close();
@@ -187,6 +192,7 @@ class WriteQueue {
     bool closed_ = false;
     boost::asio::experimental::channel<void(boost::system::error_code, Frame)> channel_;
     boost::asio::experimental::channel<void(boost::system::error_code)> space_channel_;
+    WriteObserver write_observer_;
 };
 
 } // namespace rillnet

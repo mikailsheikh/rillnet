@@ -228,6 +228,7 @@ TEST(WriteQueueTest, TransportWriteFailureStopsRunAndReportsFailure)
     const auto run_result = run_future.get();
     EXPECT_FALSE(run_result.ok());
     EXPECT_EQ(run_result.status, StatusCode::transport_error);
+    EXPECT_FALSE(transport.is_open());
     EXPECT_TRUE(transport.writes_.empty());
 }
 

@@ -15,10 +15,12 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -76,6 +78,43 @@ std::vector<std::byte> encode_cancel_bytes(StreamId stream)
     cancel.header.stream = stream;
     return encode_frame(cancel);
 }
+
+class DisconnectingTransport final : public rillnet::Transport {
+  public:
+    explicit DisconnectingTransport(std::vector<std::byte> incoming)
+        : incoming_(std::move(incoming))
+    {
+    }
+
+    boost::asio::awaitable<std::size_t> read(std::span<std::byte> buffer) override
+    {
+        if (delivered_) {
+            open_ = false;
+            co_return 0;
+        }
+
+        std::copy(incoming_.begin(), incoming_.end(), buffer.begin());
+        delivered_ = true;
+        co_return incoming_.size();
+    }
+
+    boost::asio::awaitable<void> write(std::span<const std::byte> buffer) override
+    {
+        outgoing_.insert(outgoing_.end(), buffer.begin(), buffer.end());
+        co_return;
+    }
+
+    void close() noexcept override { open_ = false; }
+
+    [[nodiscard]] bool is_open() const noexcept override { return open_; }
+    [[nodiscard]] const std::vector<std::byte> &outgoing() const noexcept { return outgoing_; }
+
+  private:
+    std::vector<std::byte> incoming_;
+    std::vector<std::byte> outgoing_;
+    bool delivered_ = false;
+    bool open_ = true;
+};
 
 TEST(ServerConnectionTest, DispatchesHandlersWithoutBlockingTheReadLoop)
 {
@@ -217,6 +256,32 @@ TEST(ServerConnectionTest, ExposesRemoteCancellationToOnlyTheMatchingHandler)
     EXPECT_EQ(responses[0].header.stream, StreamId{3});
     EXPECT_EQ(responses[0].header.type, FrameType::response);
     EXPECT_FALSE(has_flag(responses[0].header.flags, FrameFlags::cancel));
+}
+
+TEST(ServerConnectionTest, CancelsActiveHandlerWhenTheTransportDisconnects)
+{
+    boost::asio::io_context context;
+    const auto registry = make_registry();
+    auto transport = std::make_unique<DisconnectingTransport>(encode_request_bytes(registry));
+    auto *transport_ptr = transport.get();
+    ServerConnection connection(context.get_executor(), std::move(transport), registry);
+    bool handler_saw_disconnect = false;
+
+    connection.handle<StartSimulation>(
+        [&handler_saw_disconnect](SessionContext &session,
+                                  StartSimulation) -> boost::asio::awaitable<SimulationStarted> {
+            co_await boost::asio::post(boost::asio::use_awaitable);
+            handler_saw_disconnect = session.is_cancelled();
+            co_return SimulationStarted{};
+        });
+
+    auto future =
+        boost::asio::co_spawn(context, [&]() { return connection.run(); }, boost::asio::use_future);
+    context.run();
+
+    future.get();
+    EXPECT_TRUE(handler_saw_disconnect);
+    EXPECT_TRUE(transport_ptr->outgoing().empty());
 }
 
 } // namespace

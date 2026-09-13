@@ -10,6 +10,7 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstddef>
 #include <memory>
 #include <vector>
@@ -71,6 +72,46 @@ TEST(TcpServerTest, StopBeforeRunCompletesImmediately)
     context.run();
 
     server_future.get();
+}
+
+TEST(TcpServerTest, ShutdownDrainsRegisteredConnectionsToOneDeadline)
+{
+    using Clock = std::chrono::steady_clock;
+
+    boost::asio::io_context context;
+    TcpServer server(context, tcp::endpoint(boost::asio::ip::make_address("127.0.0.1"), 0));
+    std::size_t shutdowns = 0;
+    Clock::time_point first_deadline;
+    Clock::time_point second_deadline;
+
+    server.register_connection_shutdown(
+        [&shutdowns, &first_deadline](Clock::time_point deadline) -> boost::asio::awaitable<void> {
+            ++shutdowns;
+            first_deadline = deadline;
+            co_return;
+        });
+    server.register_connection_shutdown(
+        [&shutdowns, &second_deadline](Clock::time_point deadline) -> boost::asio::awaitable<void> {
+            ++shutdowns;
+            second_deadline = deadline;
+            co_return;
+        });
+
+    auto shutdown_future = boost::asio::co_spawn(context, server.shutdown(std::chrono::seconds(1)),
+                                                 boost::asio::use_future);
+    context.run();
+
+    shutdown_future.get();
+    EXPECT_EQ(shutdowns, 2U);
+    EXPECT_EQ(first_deadline, second_deadline);
+    EXPECT_GT(first_deadline, Clock::now());
+
+    context.restart();
+    auto second_shutdown_future = boost::asio::co_spawn(
+        context, server.shutdown(std::chrono::seconds(1)), boost::asio::use_future);
+    context.run();
+    second_shutdown_future.get();
+    EXPECT_EQ(shutdowns, 2U);
 }
 
 } // namespace

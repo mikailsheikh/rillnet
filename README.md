@@ -13,7 +13,7 @@ The library is useful in its current state when you want a small protocol layer 
 - Incremental frame decoding from byte-stream input, including malformed-frame terminal error state.
 - A transport abstraction with a Boost.Asio TCP implementation.
 - Asynchronous TCP client connection establishment with timeout-aware `ConnectResult` failures.
-- Asynchronous TCP server accept loop that hands each accepted socket to a connection handler as a `Transport`.
+- Asynchronous TCP server accept loop that hands each accepted socket to a connection handler as a `Transport`, with deadline-based graceful shutdown for registered connections.
 - A codec concept with `EncodeResult` and `DecodeResult<T>` result types.
 - `PodCodec`, a minimal built-in codec for trivially copyable messages, intended for tests and simple examples rather than portable application wire formats.
 - A typed message registry mapping C++ message types to non-zero wire `MessageType` identifiers per protocol version.
@@ -70,3 +70,8 @@ requests are rejected, while existing client requests and server handlers are al
 When the duration expires, unfinished work is completed with `StatusCode::connection_closed` and
 the transport is closed. The operation is awaitable and returns after the connection reaches the
 closed state.
+
+`TcpServer::shutdown(duration)` first stops accepting connections, then invokes all registered
+connection drain handlers concurrently with one shared deadline. A connection handler should
+register its `ServerConnection::shutdown` operation with `register_connection_shutdown` when it
+takes ownership of an accepted transport.

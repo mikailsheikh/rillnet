@@ -114,14 +114,17 @@ template <typename CodecType = PodCodec> class ServerConnection {
     boost::asio::awaitable<void> read_loop()
     {
         std::array<std::byte, 4096> buffer{};
+        bool connection_lost = false;
         while (transport_->is_open()) {
             std::size_t bytes_read = 0;
             try {
                 bytes_read = co_await transport_->read(buffer);
             } catch (const boost::system::system_error &) {
+                connection_lost = true;
                 break;
             }
             if (bytes_read == 0) {
+                connection_lost = !transport_->is_open();
                 break;
             }
 
@@ -129,8 +132,21 @@ template <typename CodecType = PodCodec> class ServerConnection {
                 dispatch(std::move(frame));
             }
         }
+        if (connection_lost) {
+            fail_operations_on_connection_close();
+        }
         reading_ = false;
         close_queue_when_idle();
+    }
+
+    void fail_operations_on_connection_close()
+    {
+        for (const auto &[stream, operation] : operations_) {
+            (void)stream;
+            (void)operation->request_cancellation();
+            (void)operation->fail(StatusCode::connection_closed,
+                                  "connection closed while processing a request");
+        }
     }
 
     void dispatch(Frame frame)

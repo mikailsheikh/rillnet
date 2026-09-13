@@ -135,6 +135,7 @@ class WriteQueue {
                 co_await transport_.write(encoded);
             } catch (const boost::system::system_error &write_error) {
                 close();
+                transport_.close();
                 co_return WriteResult::failure(StatusCode::transport_error, write_error.what());
             }
         }

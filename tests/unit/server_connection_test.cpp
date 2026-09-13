@@ -5,9 +5,14 @@
 
 #include "in_memory_transport.hpp"
 
+#include <rillnet/diagnostics.hpp>
+#include <rillnet/protocol_violation.hpp>
+
 #include <boost/asio/co_spawn.hpp>
+#include <boost/asio/experimental/channel.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/post.hpp>
+#include <boost/asio/redirect_error.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include <boost/asio/strand.hpp>
 #include <boost/asio/use_awaitable.hpp>
@@ -19,15 +24,21 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <future>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
 
 using rillnet::decode_message;
+using rillnet::DiagnosticsEvent;
+using rillnet::DiagnosticsEventType;
+using rillnet::DiagnosticsHooks;
 using rillnet::encode_frame;
 using rillnet::encode_message;
 using rillnet::Frame;
@@ -40,6 +51,8 @@ using rillnet::ServerConnection;
 using rillnet::SessionContext;
 using rillnet::StatusCode;
 using rillnet::StreamId;
+using rillnet::testing::DuplexTransport;
+using rillnet::testing::FramePeer;
 using rillnet::testing::InMemoryTransport;
 
 struct StartSimulation {
@@ -78,6 +91,46 @@ std::vector<std::byte> encode_cancel_bytes(StreamId stream)
     cancel.header.flags = FrameFlags::cancel | FrameFlags::end_of_stream;
     cancel.header.stream = stream;
     return encode_frame(cancel);
+}
+
+Frame make_request_frame(const MessageRegistry<> &registry, StreamId stream, std::uint32_t id)
+{
+    auto encoded = encode_message(registry, StartSimulation{id}, stream);
+    EXPECT_TRUE(encoded.ok());
+    return std::move(*encoded.frame); // NOLINT(bugprone-unchecked-optional-access)
+}
+
+Frame make_cancel_frame(StreamId stream)
+{
+    Frame cancel;
+    cancel.header.type = FrameType::request;
+    cancel.header.flags = FrameFlags::cancel | FrameFlags::end_of_stream;
+    cancel.header.stream = stream;
+    return cancel;
+}
+
+void append_frame(std::vector<std::byte> &bytes, const Frame &frame)
+{
+    const auto encoded = encode_frame(frame);
+    bytes.insert(bytes.end(), encoded.begin(), encoded.end());
+}
+
+void join(std::future<void> &future)
+{
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(0)), std::future_status::ready);
+    future.get();
+}
+
+// Closes both ends and drains once more after the scenario should already be finished, so a
+// regression fails an assertion instead of hanging the suite on a future that never completes.
+void run_until_idle(boost::asio::io_context &context, rillnet::Transport &server_transport,
+                    FramePeer &peer)
+{
+    context.run_for(std::chrono::seconds(5));
+    server_transport.close();
+    peer.close();
+    context.restart();
+    context.run_for(std::chrono::milliseconds(100));
 }
 
 class DisconnectingTransport final : public rillnet::Transport {
@@ -335,6 +388,462 @@ TEST(ServerConnectionTest, GracefulShutdownClosesAnIdleConnection)
 
     shutdown_future.get();
     run_future.get();
+}
+
+struct HandlerOutcome {
+    bool finished = false;
+    bool saw_cancellation = false;
+    bool transport_open = true;
+    std::size_t written_frames = 0;
+};
+
+// Delivers one request followed by `trailing_bytes`, and suspends the handler long enough for the
+// read loop to finish before the handler inspects its cancellation state.
+HandlerOutcome handler_outcome_for(std::vector<std::byte> trailing_bytes)
+{
+    boost::asio::io_context context;
+    const auto registry = make_registry();
+
+    std::vector<std::byte> incoming;
+    append_frame(incoming, make_request_frame(registry, StreamId{1}, 7));
+    incoming.insert(incoming.end(), trailing_bytes.begin(), trailing_bytes.end());
+
+    auto transport = std::make_unique<InMemoryTransport>(std::move(incoming));
+    auto *transport_observer = transport.get();
+    ServerConnection connection(context.get_executor(), std::move(transport), registry);
+    HandlerOutcome outcome;
+
+    connection.handle<StartSimulation>(
+        [&outcome](SessionContext &session,
+                   StartSimulation request) -> boost::asio::awaitable<SimulationStarted> {
+            co_await boost::asio::post(boost::asio::use_awaitable);
+            outcome.saw_cancellation = session.is_cancelled();
+            outcome.finished = true;
+            co_return SimulationStarted{request.id};
+        });
+
+    auto run_future =
+        boost::asio::co_spawn(context, [&]() { return connection.run(); }, boost::asio::use_future);
+
+    context.run_for(std::chrono::seconds(5));
+    join(run_future);
+
+    outcome.transport_open = transport_observer->is_open();
+    FrameDecoder decoder;
+    outcome.written_frames = decoder.push(transport_observer->outgoing()).size();
+    return outcome;
+}
+
+// BUG: a protocol violation closes the transport from inside dispatch(), so the read loop leaves
+// with connection_lost still false and fail_operations_on_connection_close() never runs. Handlers
+// that were already active keep going without ever learning that the connection is gone, and the
+// response they eventually produce is written into a closed transport and silently discarded.
+TEST(ServerConnectionTest, LeavesAnActiveHandlerUnawareOfAProtocolViolationThatClosedTheConnection)
+{
+    Frame response_frame; // a server may only ever receive requests
+    response_frame.header.type = FrameType::response;
+    response_frame.header.stream = StreamId{3};
+    std::vector<std::byte> violation;
+    append_frame(violation, response_frame);
+
+    const auto outcome = handler_outcome_for(std::move(violation));
+
+    EXPECT_FALSE(outcome.transport_open);
+    EXPECT_TRUE(outcome.finished);
+    EXPECT_FALSE(outcome.saw_cancellation);
+    EXPECT_EQ(outcome.written_frames, 0U);
+}
+
+TEST(ServerConnectionTest, CancelsActiveHandlersWhenAProtocolViolationClosesTheConnection)
+{
+    Frame response_frame;
+    response_frame.header.type = FrameType::response;
+    response_frame.header.stream = StreamId{3};
+    std::vector<std::byte> violation;
+    append_frame(violation, response_frame);
+
+    const auto outcome = handler_outcome_for(std::move(violation));
+
+    EXPECT_TRUE(outcome.saw_cancellation);
+}
+
+// BUG: the same is true of a malformed frame. The decoder's terminal error closes the transport
+// directly instead of going through the connection-loss path, so active handlers are neither
+// cancelled nor failed.
+TEST(ServerConnectionTest, LeavesAnActiveHandlerUnawareOfAMalformedFrameThatClosedTheConnection)
+{
+    Frame malformed;
+    malformed.header.stream = StreamId{3};
+    malformed.header.flags = static_cast<FrameFlags>(1U << 7U); // no such flag exists
+    std::vector<std::byte> violation;
+    append_frame(violation, malformed);
+
+    const auto outcome = handler_outcome_for(std::move(violation));
+
+    EXPECT_FALSE(outcome.transport_open);
+    EXPECT_TRUE(outcome.finished);
+    EXPECT_FALSE(outcome.saw_cancellation);
+}
+
+// A peer that stops sending without the transport closing itself leaves every active operation
+// alone, so the handler finishes and its response is still written. Whether an active handler is
+// cancelled at end-of-stream therefore depends on the Transport implementation: TcpTransport
+// closes itself on EOF (see CancelsActiveHandlerWhenTheTransportDisconnects), an in-memory
+// transport does not.
+TEST(ServerConnectionTest, FinishesAnActiveHandlerWhenThePeerStopsSendingWithoutClosing)
+{
+    const auto outcome = handler_outcome_for({});
+
+    EXPECT_TRUE(outcome.transport_open);
+    EXPECT_TRUE(outcome.finished);
+    EXPECT_FALSE(outcome.saw_cancellation);
+    EXPECT_EQ(outcome.written_frames, 1U);
+}
+
+struct LateCancellationOutcome {
+    bool first_response = false;
+    bool second_response = false;
+    std::size_t handled_requests = 0;
+};
+
+// Answers a request, then cancels it: the cancellation and the response crossed on the wire, so
+// the server sees a cancellation for an operation it has already completed and forgotten.
+LateCancellationOutcome outcome_when_a_cancellation_follows_its_response()
+{
+    boost::asio::io_context context;
+    const auto registry = make_registry();
+    auto transports = DuplexTransport::make_pair(context.get_executor());
+    auto *server_transport = transports.first.get();
+    ServerConnection connection(context.get_executor(), std::move(transports.first), registry);
+    FramePeer peer(std::move(transports.second));
+    LateCancellationOutcome outcome;
+
+    connection.handle<StartSimulation>(
+        [&outcome](SessionContext &,
+                   StartSimulation request) -> boost::asio::awaitable<SimulationStarted> {
+            ++outcome.handled_requests;
+            co_return SimulationStarted{request.id};
+        });
+
+    auto peer_future = boost::asio::co_spawn(
+        context,
+        [&]() -> boost::asio::awaitable<void> {
+            EXPECT_TRUE(co_await peer.send(make_request_frame(registry, StreamId{1}, 7)));
+            const auto first = co_await peer.receive();
+            outcome.first_response = first.has_value();
+
+            (void)co_await peer.send(make_cancel_frame(StreamId{1}));
+            (void)co_await peer.send(make_request_frame(registry, StreamId{3}, 9));
+            const auto second = co_await peer.receive();
+            outcome.second_response = second.has_value();
+            peer.close();
+        },
+        boost::asio::use_future);
+    auto run_future =
+        boost::asio::co_spawn(context, [&]() { return connection.run(); }, boost::asio::use_future);
+
+    run_until_idle(context, *server_transport, peer);
+    join(peer_future);
+    join(run_future);
+    return outcome;
+}
+
+// BUG: dispatch() treats a cancellation for a stream that is no longer active as unknown_stream
+// and tears the connection down. A cancellation that loses the race against its own response is
+// an ordinary occurrence, so a well-behaved client can lose every other operation on the
+// connection by cancelling a request at the wrong moment.
+TEST(ServerConnectionTest, TearsDownTheConnectionForACancellationThatCrossesItsResponse)
+{
+    const auto outcome = outcome_when_a_cancellation_follows_its_response();
+
+    EXPECT_TRUE(outcome.first_response);
+    EXPECT_FALSE(outcome.second_response);
+    EXPECT_EQ(outcome.handled_requests, 1U);
+}
+
+TEST(ServerConnectionTest, KeepsServingAfterACancellationThatCrossesItsResponse)
+{
+    const auto outcome = outcome_when_a_cancellation_follows_its_response();
+
+    EXPECT_TRUE(outcome.second_response);
+    EXPECT_EQ(outcome.handled_requests, 2U);
+}
+
+struct DrainCancellationOutcome {
+    std::optional<Frame> reply;
+    bool handler_saw_cancellation = false;
+    bool reached_closed_state = false;
+};
+
+// Cancels an operation whose handler is still running while the connection is draining.
+DrainCancellationOutcome outcome_when_a_cancellation_arrives_while_draining()
+{
+    using Signal = boost::asio::experimental::channel<void(boost::system::error_code)>;
+
+    boost::asio::io_context context;
+    const auto registry = make_registry();
+    auto transports = DuplexTransport::make_pair(context.get_executor());
+    auto *server_transport = transports.first.get();
+    ServerConnection connection(context.get_executor(), std::move(transports.first), registry);
+    FramePeer peer(std::move(transports.second));
+    Signal started(context.get_executor(), 1);
+    Signal release(context.get_executor(), 1);
+    DrainCancellationOutcome outcome;
+
+    connection.handle<StartSimulation>(
+        [&](SessionContext &session,
+            StartSimulation request) -> boost::asio::awaitable<SimulationStarted> {
+            EXPECT_TRUE(started.try_send(boost::system::error_code{}));
+            boost::system::error_code error;
+            co_await release.async_receive(
+                boost::asio::redirect_error(boost::asio::use_awaitable, error));
+            outcome.handler_saw_cancellation = session.is_cancelled();
+            co_return SimulationStarted{request.id};
+        });
+
+    auto shutdown_future = boost::asio::co_spawn(
+        context,
+        [&]() -> boost::asio::awaitable<void> {
+            boost::system::error_code error;
+            co_await started.async_receive(
+                boost::asio::redirect_error(boost::asio::use_awaitable, error));
+            co_await connection.shutdown(std::chrono::seconds{30});
+            outcome.reached_closed_state = connection.state() == rillnet::ConnectionState::closed;
+        },
+        boost::asio::use_future);
+    auto peer_future = boost::asio::co_spawn(
+        context,
+        [&]() -> boost::asio::awaitable<void> {
+            EXPECT_TRUE(co_await peer.send(make_request_frame(registry, StreamId{1}, 7)));
+            while (connection.state() != rillnet::ConnectionState::draining) {
+                co_await boost::asio::post(boost::asio::use_awaitable);
+            }
+
+            (void)co_await peer.send(make_cancel_frame(StreamId{1}));
+            outcome.reply = co_await peer.receive();
+            EXPECT_TRUE(release.try_send(boost::system::error_code{}));
+        },
+        boost::asio::use_future);
+    auto run_future =
+        boost::asio::co_spawn(context, [&]() { return connection.run(); }, boost::asio::use_future);
+
+    run_until_idle(context, *server_transport, peer);
+    join(peer_future);
+    join(shutdown_future);
+    join(run_future);
+    return outcome;
+}
+
+// BUG: while draining, dispatch() answers every incoming frame with an error frame before it ever
+// looks at the frame type, so a cancellation for an operation that is still running is dropped.
+// The handler never learns that its caller gave up, which is exactly the case a drain deadline
+// depends on. The error frame the peer receives instead carries StatusCode::connection_closed,
+// which decode_error_status() cannot decode.
+TEST(ServerConnectionTest, IgnoresACancellationThatArrivesWhileDraining)
+{
+    const auto outcome = outcome_when_a_cancellation_arrives_while_draining();
+
+    ASSERT_TRUE(outcome.reply.has_value());
+    EXPECT_EQ(outcome.reply->header.stream, StreamId{1});
+    EXPECT_TRUE(has_flag(outcome.reply->header.flags, FrameFlags::error));
+    EXPECT_FALSE(rillnet::decode_error_status(*outcome.reply).has_value());
+    EXPECT_FALSE(outcome.handler_saw_cancellation);
+    EXPECT_TRUE(outcome.reached_closed_state);
+}
+
+TEST(ServerConnectionTest, CancelsARunningHandlerWhenACancellationArrivesWhileDraining)
+{
+    const auto outcome = outcome_when_a_cancellation_arrives_while_draining();
+
+    EXPECT_TRUE(outcome.handler_saw_cancellation);
+}
+
+TEST(ServerConnectionTest, GracefulShutdownWaitsForAnInFlightHandlerAndDeliversItsResponse)
+{
+    using Signal = boost::asio::experimental::channel<void(boost::system::error_code)>;
+
+    boost::asio::io_context context;
+    const auto registry = make_registry();
+    auto transports = DuplexTransport::make_pair(context.get_executor());
+    auto *server_transport = transports.first.get();
+    ServerConnection connection(context.get_executor(), std::move(transports.first), registry);
+    FramePeer peer(std::move(transports.second));
+    Signal started(context.get_executor(), 1);
+    Signal release(context.get_executor(), 1);
+    std::optional<Frame> response;
+    auto drain_duration = std::chrono::steady_clock::duration::max();
+
+    connection.handle<StartSimulation>(
+        [&](SessionContext &,
+            StartSimulation request) -> boost::asio::awaitable<SimulationStarted> {
+            EXPECT_TRUE(started.try_send(boost::system::error_code{}));
+            boost::system::error_code error;
+            co_await release.async_receive(
+                boost::asio::redirect_error(boost::asio::use_awaitable, error));
+            co_return SimulationStarted{request.id};
+        });
+
+    auto shutdown_future = boost::asio::co_spawn(
+        context,
+        [&]() -> boost::asio::awaitable<void> {
+            boost::system::error_code error;
+            co_await started.async_receive(
+                boost::asio::redirect_error(boost::asio::use_awaitable, error));
+            const auto begin = std::chrono::steady_clock::now();
+            co_await connection.shutdown(std::chrono::seconds{30});
+            drain_duration = std::chrono::steady_clock::now() - begin;
+            EXPECT_EQ(connection.state(), rillnet::ConnectionState::closed);
+        },
+        boost::asio::use_future);
+    auto peer_future = boost::asio::co_spawn(
+        context,
+        [&]() -> boost::asio::awaitable<void> {
+            EXPECT_TRUE(co_await peer.send(make_request_frame(registry, StreamId{1}, 7)));
+            while (connection.state() != rillnet::ConnectionState::draining) {
+                co_await boost::asio::post(boost::asio::use_awaitable);
+            }
+
+            EXPECT_TRUE(release.try_send(boost::system::error_code{}));
+            response = co_await peer.receive();
+        },
+        boost::asio::use_future);
+    auto run_future =
+        boost::asio::co_spawn(context, [&]() { return connection.run(); }, boost::asio::use_future);
+
+    run_until_idle(context, *server_transport, peer);
+    join(peer_future);
+    join(shutdown_future);
+    join(run_future);
+
+    ASSERT_TRUE(response.has_value());
+    EXPECT_EQ(response->header.stream, StreamId{1});
+    EXPECT_TRUE(has_flag(response->header.flags, FrameFlags::end_of_stream));
+    EXPECT_FALSE(has_flag(response->header.flags, FrameFlags::error));
+    const auto decoded = decode_message<SimulationStarted>(registry, *response);
+    ASSERT_TRUE(decoded.ok());
+    ASSERT_TRUE(decoded.value.has_value());
+    EXPECT_EQ(decoded.value->id, 7U); // NOLINT(bugprone-unchecked-optional-access)
+    EXPECT_LT(drain_duration, std::chrono::seconds{25});
+}
+
+struct DuplicateStreamOutcome {
+    bool transport_open = true;
+    std::size_t handled_requests = 0;
+    std::size_t protocol_errors = 0;
+    std::size_t written_frames = 0;
+};
+
+DuplicateStreamOutcome outcome_for_a_second_request_on_an_active_stream()
+{
+    boost::asio::io_context context;
+    const auto registry = make_registry();
+
+    std::vector<std::byte> incoming;
+    append_frame(incoming, make_request_frame(registry, StreamId{1}, 7));
+    append_frame(incoming, make_request_frame(registry, StreamId{1}, 8));
+
+    DuplicateStreamOutcome outcome;
+    const DiagnosticsHooks hooks{[&outcome](const DiagnosticsEvent &event) {
+        if (event.type == DiagnosticsEventType::protocol_error) {
+            ++outcome.protocol_errors;
+        }
+    }};
+    auto transport = std::make_unique<InMemoryTransport>(std::move(incoming));
+    auto *transport_observer = transport.get();
+    ServerConnection connection(context.get_executor(), std::move(transport), registry, {}, hooks);
+
+    connection.handle<StartSimulation>(
+        [&outcome](SessionContext &,
+                   StartSimulation request) -> boost::asio::awaitable<SimulationStarted> {
+            ++outcome.handled_requests;
+            co_await boost::asio::post(boost::asio::use_awaitable);
+            co_return SimulationStarted{request.id};
+        });
+
+    auto run_future =
+        boost::asio::co_spawn(context, [&]() { return connection.run(); }, boost::asio::use_future);
+
+    context.run_for(std::chrono::seconds(5));
+    join(run_future);
+
+    outcome.transport_open = transport_observer->is_open();
+    FrameDecoder decoder;
+    outcome.written_frames = decoder.push(transport_observer->outgoing()).size();
+    return outcome;
+}
+
+// BUG: a second request on a stream that is already active closes the transport directly instead
+// of going through fail_connection(), so the peer is given no error frame and no protocol_error
+// diagnostic is reported for a violation that terminates the whole connection.
+TEST(ServerConnectionTest, ClosesTheConnectionSilentlyForASecondRequestOnAnActiveStream)
+{
+    const auto outcome = outcome_for_a_second_request_on_an_active_stream();
+
+    EXPECT_FALSE(outcome.transport_open);
+    EXPECT_EQ(outcome.handled_requests, 1U);
+    EXPECT_EQ(outcome.written_frames, 0U);
+    EXPECT_EQ(outcome.protocol_errors, 0U);
+}
+
+TEST(ServerConnectionTest, ReportsAProtocolErrorForASecondRequestOnAnActiveStream)
+{
+    const auto outcome = outcome_for_a_second_request_on_an_active_stream();
+
+    EXPECT_EQ(outcome.protocol_errors, 1U);
+}
+
+TEST(ServerConnectionTest, ReportsDiagnosticsForTheWholeLifeOfARequest)
+{
+    boost::asio::io_context context;
+    const auto registry = make_registry();
+    std::vector<DiagnosticsEvent> events;
+    const DiagnosticsHooks hooks{
+        [&events](const DiagnosticsEvent &event) { events.push_back(event); }};
+
+    std::vector<std::byte> incoming;
+    append_frame(incoming, make_request_frame(registry, StreamId{1}, 7));
+    ServerConnection connection(context.get_executor(),
+                                std::make_unique<InMemoryTransport>(std::move(incoming)), registry,
+                                {}, hooks);
+
+    connection.handle<StartSimulation>(
+        [](SessionContext &, StartSimulation request) -> boost::asio::awaitable<SimulationStarted> {
+            co_return SimulationStarted{request.id};
+        });
+
+    auto run_future =
+        boost::asio::co_spawn(context, [&]() { return connection.run(); }, boost::asio::use_future);
+
+    context.run_for(std::chrono::seconds(5));
+    join(run_future);
+
+    const auto count = [&events](DiagnosticsEventType type) {
+        return std::count_if(events.begin(), events.end(),
+                             [type](const DiagnosticsEvent &event) { return event.type == type; });
+    };
+    const auto transferred = [&events](DiagnosticsEventType type, bool inbound) {
+        return std::any_of(events.begin(), events.end(),
+                           [type, inbound](const DiagnosticsEvent &event) {
+                               return event.type == type && event.inbound == inbound;
+                           });
+    };
+
+    EXPECT_EQ(count(DiagnosticsEventType::connection_opened), 1);
+    EXPECT_EQ(count(DiagnosticsEventType::request_started), 1);
+    EXPECT_EQ(count(DiagnosticsEventType::request_completed), 1);
+    EXPECT_EQ(count(DiagnosticsEventType::connection_closed), 1);
+    EXPECT_EQ(count(DiagnosticsEventType::cancellation), 0);
+    EXPECT_EQ(count(DiagnosticsEventType::protocol_error), 0);
+    EXPECT_TRUE(transferred(DiagnosticsEventType::bytes_transferred, true));
+    EXPECT_TRUE(transferred(DiagnosticsEventType::bytes_transferred, false));
+    EXPECT_TRUE(transferred(DiagnosticsEventType::message_transferred, true));
+    EXPECT_TRUE(transferred(DiagnosticsEventType::message_transferred, false));
+    for (const auto &event : events) {
+        if (event.type == DiagnosticsEventType::request_started ||
+            event.type == DiagnosticsEventType::request_completed) {
+            EXPECT_EQ(event.stream, StreamId{1});
+        }
+    }
 }
 
 } // namespace

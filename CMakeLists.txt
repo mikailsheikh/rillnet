@@ -54,6 +54,7 @@ set(rillnet_format_sources
   tests/unit/message_registry_test.cpp
   tests/unit/message_codec_test.cpp
   tests/unit/error_test.cpp
+  tests/unit/protocol_violation_test.cpp
   tests/unit/lifecycle_test.cpp
   tests/unit/operation_test.cpp
   tests/unit/stream_id_allocator_test.cpp

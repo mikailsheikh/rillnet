@@ -2,17 +2,23 @@
 
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/co_spawn.hpp>
+#include <boost/asio/experimental/channel.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/address.hpp>
 #include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/redirect_error.hpp>
+#include <boost/asio/this_coro.hpp>
 #include <boost/asio/use_awaitable.hpp>
 #include <boost/asio/use_future.hpp>
+#include <boost/system/error_code.hpp>
 
 #include <gtest/gtest.h>
 
 #include <chrono>
 #include <cstddef>
+#include <future>
 #include <memory>
+#include <stdexcept>
 #include <vector>
 
 namespace {
@@ -112,6 +118,157 @@ TEST(TcpServerTest, ShutdownDrainsRegisteredConnectionsToOneDeadline)
     context.run();
     second_shutdown_future.get();
     EXPECT_EQ(shutdowns, 2U);
+}
+
+TEST(TcpServerTest, ShutdownWithoutRegisteredConnectionsCompletesImmediately)
+{
+    boost::asio::io_context context;
+    TcpServer server(context, tcp::endpoint(boost::asio::ip::make_address("127.0.0.1"), 0));
+
+    auto run_future = boost::asio::co_spawn(context, server.run(), boost::asio::use_future);
+    auto shutdown_future = boost::asio::co_spawn(context, server.shutdown(std::chrono::seconds(30)),
+                                                 boost::asio::use_future);
+
+    context.run_for(std::chrono::seconds(5));
+
+    ASSERT_EQ(shutdown_future.wait_for(std::chrono::seconds(0)), std::future_status::ready);
+    shutdown_future.get();
+    ASSERT_EQ(run_future.wait_for(std::chrono::seconds(0)), std::future_status::ready);
+    run_future.get();
+}
+
+TEST(TcpServerTest, ShutdownDrainsRegisteredConnectionsConcurrently)
+{
+    using Clock = std::chrono::steady_clock;
+    using Signal = boost::asio::experimental::channel<void(boost::system::error_code)>;
+
+    boost::asio::io_context context;
+    TcpServer server(context, tcp::endpoint(boost::asio::ip::make_address("127.0.0.1"), 0));
+    Signal rendezvous(context.get_executor(), 1);
+    bool first_resumed = false;
+    bool second_started = false;
+
+    // The first drain only finishes once the second one has started, so it can only complete if
+    // the handlers are run concurrently rather than one after another.
+    server.register_connection_shutdown([&](Clock::time_point) -> boost::asio::awaitable<void> {
+        boost::system::error_code error;
+        co_await rendezvous.async_receive(
+            boost::asio::redirect_error(boost::asio::use_awaitable, error));
+        first_resumed = !error;
+    });
+    server.register_connection_shutdown([&](Clock::time_point) -> boost::asio::awaitable<void> {
+        second_started = true;
+        EXPECT_TRUE(rendezvous.try_send(boost::system::error_code{}));
+        co_return;
+    });
+
+    auto shutdown_future = boost::asio::co_spawn(context, server.shutdown(std::chrono::seconds(30)),
+                                                 boost::asio::use_future);
+
+    context.run_for(std::chrono::seconds(5));
+    rendezvous.close();
+    context.restart();
+    context.run_for(std::chrono::milliseconds(100));
+
+    ASSERT_EQ(shutdown_future.wait_for(std::chrono::seconds(0)), std::future_status::ready);
+    shutdown_future.get();
+    EXPECT_TRUE(second_started);
+    EXPECT_TRUE(first_resumed);
+}
+
+TEST(TcpServerTest, ShutdownCompletesWhenAConnectionDrainThrows)
+{
+    using Clock = std::chrono::steady_clock;
+
+    boost::asio::io_context context;
+    TcpServer server(context, tcp::endpoint(boost::asio::ip::make_address("127.0.0.1"), 0));
+    bool second_drained = false;
+
+    server.register_connection_shutdown([](Clock::time_point) -> boost::asio::awaitable<void> {
+        throw std::runtime_error("drain failed");
+        co_return;
+    });
+    server.register_connection_shutdown(
+        [&second_drained](Clock::time_point) -> boost::asio::awaitable<void> {
+            second_drained = true;
+            co_return;
+        });
+
+    auto shutdown_future = boost::asio::co_spawn(context, server.shutdown(std::chrono::seconds(30)),
+                                                 boost::asio::use_future);
+
+    context.run_for(std::chrono::seconds(5));
+
+    ASSERT_EQ(shutdown_future.wait_for(std::chrono::seconds(0)), std::future_status::ready);
+    shutdown_future.get();
+    EXPECT_TRUE(second_drained);
+}
+
+// A connection that has already closed has no way of withdrawing the drain handler it registered
+// when it was accepted, so shutdown() still invokes it. A handler that captures its connection
+// therefore has to outlive every connection the server ever accepted, and the registration list
+// grows for the lifetime of the server.
+TEST(TcpServerTest, ShutdownStillDrainsConnectionsThatHaveAlreadyFinished)
+{
+    using Clock = std::chrono::steady_clock;
+
+    boost::asio::io_context context;
+    TcpServer server(context, tcp::endpoint(boost::asio::ip::make_address("127.0.0.1"), 0));
+    bool connection_finished = false;
+    bool drained_after_finishing = false;
+
+    server.register_connection_shutdown([&connection_finished, &drained_after_finishing](
+                                            Clock::time_point) -> boost::asio::awaitable<void> {
+        drained_after_finishing = connection_finished;
+        co_return;
+    });
+    connection_finished = true;
+
+    auto shutdown_future = boost::asio::co_spawn(context, server.shutdown(std::chrono::seconds(30)),
+                                                 boost::asio::use_future);
+
+    context.run_for(std::chrono::seconds(5));
+
+    ASSERT_EQ(shutdown_future.wait_for(std::chrono::seconds(0)), std::future_status::ready);
+    shutdown_future.get();
+    EXPECT_TRUE(drained_after_finishing);
+}
+
+TEST(TcpServerTest, ShutdownStopsAcceptingBeforeDrainingConnections)
+{
+    using Clock = std::chrono::steady_clock;
+
+    boost::asio::io_context context;
+    TcpServer server(context, tcp::endpoint(boost::asio::ip::make_address("127.0.0.1"), 0));
+    const auto endpoint = server.local_endpoint();
+    std::size_t accepted = 0;
+    bool connect_refused = false;
+
+    server.on_connection([&accepted](std::unique_ptr<Transport>) { ++accepted; });
+    // Probing the listening endpoint from inside a drain handler shows that the acceptor is
+    // already closed by the time connections are asked to drain.
+    server.register_connection_shutdown(
+        [endpoint, &connect_refused](Clock::time_point) -> boost::asio::awaitable<void> {
+            tcp::socket socket(co_await boost::asio::this_coro::executor);
+            boost::system::error_code error;
+            co_await socket.async_connect(
+                endpoint, boost::asio::redirect_error(boost::asio::use_awaitable, error));
+            connect_refused = static_cast<bool>(error);
+            socket.close(error);
+        });
+
+    auto run_future = boost::asio::co_spawn(context, server.run(), boost::asio::use_future);
+    auto shutdown_future = boost::asio::co_spawn(context, server.shutdown(std::chrono::seconds(30)),
+                                                 boost::asio::use_future);
+
+    context.run_for(std::chrono::seconds(5));
+
+    ASSERT_EQ(shutdown_future.wait_for(std::chrono::seconds(0)), std::future_status::ready);
+    shutdown_future.get();
+    ASSERT_EQ(run_future.wait_for(std::chrono::seconds(0)), std::future_status::ready);
+    run_future.get();
+    EXPECT_TRUE(connect_refused);
+    EXPECT_EQ(accepted, 0U);
 }
 
 } // namespace

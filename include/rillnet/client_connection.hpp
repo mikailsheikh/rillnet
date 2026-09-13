@@ -8,6 +8,7 @@
 #include <rillnet/message_codec.hpp>
 #include <rillnet/message_registry.hpp>
 #include <rillnet/operation.hpp>
+#include <rillnet/protocol_violation.hpp>
 #include <rillnet/status_code.hpp>
 #include <rillnet/stream_id_allocator.hpp>
 #include <rillnet/transport.hpp>
@@ -32,6 +33,7 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace rillnet {
@@ -308,6 +310,15 @@ template <typename CodecType = PodCodec> class ClientConnection {
 
             for (auto &frame : decoder_.push(std::span(buffer).first(bytes_read))) {
                 dispatch(std::move(frame));
+                if (!transport_->is_open()) {
+                    break;
+                }
+            }
+            if (decoder_.error().has_value()) {
+                const auto error = *decoder_.error();
+                fail_connection(status_for_frame_validation(error),
+                                std::string(frame_validation_message(error)));
+                break;
             }
         }
 
@@ -324,24 +335,63 @@ template <typename CodecType = PodCodec> class ClientConnection {
     void dispatch(Frame frame)
     {
         if (frame.header.type != FrameType::response) {
+            fail_connection(StatusCode::malformed_frame, "client received a non-response frame");
             return;
         }
 
         const auto found = pending_.find(frame.header.stream);
         if (found == pending_.end()) {
-            return; // response for an unknown or already-completed stream is silently dropped
+            fail_connection(StatusCode::unknown_stream, "response received for an unknown stream");
+            return;
+        }
+        if (terminal_streams_.contains(frame.header.stream)) {
+            fail_connection(StatusCode::malformed_frame, "duplicate terminal frame");
+            return;
         }
         if (has_flag(frame.header.flags, FrameFlags::cancel)) {
             (void)cancel_pending(found->second, "operation cancelled by peer");
+            mark_terminal(frame);
             return;
         }
         const auto pending = found->second;
+        if (has_flag(frame.header.flags, FrameFlags::error)) {
+            const auto status = decode_error_status(frame);
+            if (!status.has_value()) {
+                fail_connection(StatusCode::malformed_frame, "malformed protocol error payload");
+                return;
+            }
+            (void)pending->operation.fail(*status, "peer rejected the operation");
+            pending->channel.close();
+            cleanup_pending(pending, true);
+            mark_terminal(frame);
+            return;
+        }
         if (!pending->operation.complete("response received")) {
+            fail_connection(StatusCode::malformed_frame, "duplicate terminal frame");
             return;
         }
         pending->timer.cancel();
         pending->channel.try_send(boost::system::error_code{}, std::move(frame));
         cleanup_pending(pending, true);
+        mark_terminal(frame);
+    }
+
+    void mark_terminal(const Frame &frame)
+    {
+        if (has_flag(frame.header.flags, FrameFlags::end_of_stream)) {
+            terminal_streams_.insert(frame.header.stream);
+        }
+    }
+
+    void fail_connection(StatusCode status, std::string message)
+    {
+        while (!pending_.empty()) {
+            auto pending = pending_.begin()->second;
+            (void)pending->operation.fail(status, message);
+            pending->channel.close();
+            cleanup_pending(pending, false);
+        }
+        transport_->close();
     }
 
     void timeout_pending(const std::shared_ptr<PendingRequest> &pending)
@@ -414,6 +464,7 @@ template <typename CodecType = PodCodec> class ClientConnection {
     StreamIdAllocator stream_ids_;
     FrameDecoder decoder_;
     std::unordered_map<StreamId, std::shared_ptr<PendingRequest>> pending_;
+    std::unordered_set<StreamId> terminal_streams_;
 };
 
 } // namespace rillnet

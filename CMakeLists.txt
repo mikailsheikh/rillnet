@@ -29,6 +29,7 @@ set(rillnet_format_sources
   include/rillnet/message_registry.hpp
   include/rillnet/message_codec.hpp
   include/rillnet/error.hpp
+  include/rillnet/protocol_violation.hpp
   include/rillnet/lifecycle.hpp
   include/rillnet/operation.hpp
   include/rillnet/stream_id_allocator.hpp

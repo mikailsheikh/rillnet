@@ -7,6 +7,7 @@
 #include <rillnet/message_codec.hpp>
 #include <rillnet/message_registry.hpp>
 #include <rillnet/operation.hpp>
+#include <rillnet/protocol_violation.hpp>
 #include <rillnet/transport.hpp>
 #include <rillnet/write_queue.hpp>
 
@@ -23,6 +24,7 @@
 #include <memory>
 #include <span>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace rillnet {
@@ -86,14 +88,17 @@ template <typename CodecType = PodCodec> class ServerConnection {
                 Frame frame, std::shared_ptr<Operation> operation) -> boost::asio::awaitable<void> {
                 const auto request = decode_message<Request>(registry_, frame);
                 if (!request.ok()) {
+                    (void)operation->fail(request.status, request.message);
+                    send_operation_error(frame.header.stream, request.status);
                     co_return;
                 }
 
                 SessionContext context(frame.header.stream, operation);
                 const auto response = co_await handler(context, *request.value);
-                const auto encoded =
+                auto encoded =
                     encode_message(registry_, response, frame.header.stream, FrameType::response);
                 if (encoded.ok() && operation->complete("response ready")) {
+                    encoded.frame->header.flags |= FrameFlags::end_of_stream;
                     co_await write_queue_.enqueue(std::move(*encoded.frame));
                 }
             });
@@ -129,6 +134,13 @@ template <typename CodecType = PodCodec> class ServerConnection {
 
             for (auto &frame : decoder_.push(std::span(buffer).first(bytes_read))) {
                 dispatch(std::move(frame));
+                if (!transport_->is_open()) {
+                    break;
+                }
+            }
+            if (decoder_.error().has_value()) {
+                transport_->close();
+                break;
             }
         }
         if (connection_lost) {
@@ -151,6 +163,12 @@ template <typename CodecType = PodCodec> class ServerConnection {
     void dispatch(Frame frame)
     {
         if (frame.header.type != FrameType::request) {
+            transport_->close();
+            return;
+        }
+
+        if (terminal_streams_.contains(frame.header.stream)) {
+            transport_->close();
             return;
         }
 
@@ -158,16 +176,23 @@ template <typename CodecType = PodCodec> class ServerConnection {
             const auto found = operations_.find(frame.header.stream);
             if (found != operations_.end()) {
                 (void)found->second->cancel("operation cancelled by peer");
+                mark_terminal(frame);
+            } else {
+                transport_->close();
             }
             return;
         }
 
         const auto message_type = peek_message_type(frame.payload);
         if (!message_type.has_value()) {
+            send_operation_error(frame.header.stream, StatusCode::decode_error);
+            mark_terminal(frame);
             return;
         }
         const auto found = handlers_.find(*message_type);
         if (found == handlers_.end()) {
+            send_operation_error(frame.header.stream, StatusCode::unknown_message_type);
+            mark_terminal(frame);
             return;
         }
 
@@ -175,6 +200,7 @@ template <typename CodecType = PodCodec> class ServerConnection {
         (void)operation->activate();
         const auto [inserted, did_insert] = operations_.emplace(frame.header.stream, operation);
         if (!did_insert) {
+            transport_->close();
             return;
         }
 
@@ -182,6 +208,18 @@ template <typename CodecType = PodCodec> class ServerConnection {
         boost::asio::co_spawn(executor_,
                               run_handler(found->second, std::move(frame), inserted->second),
                               boost::asio::detached);
+    }
+
+    void send_operation_error(StreamId stream, StatusCode status)
+    {
+        (void)write_queue_.try_enqueue(make_error_frame(stream, status));
+    }
+
+    void mark_terminal(const Frame &frame)
+    {
+        if (has_flag(frame.header.flags, FrameFlags::end_of_stream)) {
+            terminal_streams_.insert(frame.header.stream);
+        }
     }
 
     boost::asio::awaitable<void> run_handler(RequestHandler handler, Frame frame,
@@ -211,6 +249,7 @@ template <typename CodecType = PodCodec> class ServerConnection {
     FrameDecoder decoder_;
     std::unordered_map<MessageType, RequestHandler> handlers_;
     std::unordered_map<StreamId, std::shared_ptr<Operation>> operations_;
+    std::unordered_set<StreamId> terminal_streams_;
     std::size_t active_handlers_ = 0;
     bool reading_ = true;
 };

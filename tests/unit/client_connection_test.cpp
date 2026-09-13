@@ -37,6 +37,7 @@ using rillnet::ClientConnection;
 using rillnet::DecodeResult;
 using rillnet::encode_frame;
 using rillnet::encode_message;
+using rillnet::Frame;
 using rillnet::FrameDecoder;
 using rillnet::FrameFlags;
 using rillnet::FrameType;
@@ -279,7 +280,7 @@ TEST(ClientConnectionTest, FailsOneOperationWithoutAffectingOtherOperations)
     EXPECT_EQ(third_result.value->id, 33U);  // NOLINT(bugprone-unchecked-optional-access)
 }
 
-TEST(ClientConnectionTest, IgnoresRequestFramesWhileAwaitingAResponse)
+TEST(ClientConnectionTest, ClosesConnectionForARequestFrameOnTheClient)
 {
     boost::asio::io_context context;
     const auto registry = make_registry();
@@ -303,7 +304,7 @@ TEST(ClientConnectionTest, IgnoresRequestFramesWhileAwaitingAResponse)
     run_future.get();
     const auto result = request_future.get();
     EXPECT_FALSE(result.ok());
-    EXPECT_EQ(result.status, StatusCode::connection_closed);
+    EXPECT_EQ(result.status, StatusCode::malformed_frame);
 }
 
 TEST(ClientConnectionTest, RequestSendsAFrameAndDecodesTheMatchingResponse)
@@ -447,7 +448,7 @@ TEST(ClientConnectionTest, FailsAllOutstandingOperationsWhenTheTransportCloses)
     run_future.get();
 }
 
-TEST(ClientConnectionTest, IgnoresDuplicateResponsesAndResponsesForUnknownStreams)
+TEST(ClientConnectionTest, ClosesConnectionForAResponseOnAnUnknownStream)
 {
     boost::asio::io_context context;
     const auto registry = make_registry();
@@ -469,9 +470,41 @@ TEST(ClientConnectionTest, IgnoresDuplicateResponsesAndResponsesForUnknownStream
 
     const auto result = request_future.get();
     run_future.get();
-    ASSERT_TRUE(result.ok());
-    ASSERT_TRUE(result.value.has_value());
-    EXPECT_EQ(result.value->id, 42U); // NOLINT(bugprone-unchecked-optional-access)
+    EXPECT_FALSE(result.ok());
+    EXPECT_EQ(result.status, StatusCode::unknown_stream);
+}
+
+TEST(ClientConnectionTest, ClosesConnectionForMalformedFrameAndFailsAllOperations)
+{
+    boost::asio::io_context context;
+    const auto registry = make_registry();
+    Frame malformed;
+    malformed.header.stream = StreamId{1};
+    malformed.header.flags = static_cast<FrameFlags>(1U << 7U);
+    const auto incoming = encode_frame(malformed);
+    ClientConnection connection(context.get_executor(),
+                                std::make_unique<InMemoryTransport>(incoming), registry);
+
+    auto first = boost::asio::co_spawn(
+        context,
+        [&]() -> boost::asio::awaitable<DecodeResult<SimulationStarted>> {
+            co_return co_await connection.request<StartSimulation, SimulationStarted>({1});
+        },
+        boost::asio::use_future);
+    auto second = boost::asio::co_spawn(
+        context,
+        [&]() -> boost::asio::awaitable<DecodeResult<SimulationStarted>> {
+            co_return co_await connection.request<StartSimulation, SimulationStarted>({2});
+        },
+        boost::asio::use_future);
+    auto run_future =
+        boost::asio::co_spawn(context, [&]() { return connection.run(); }, boost::asio::use_future);
+
+    context.run();
+
+    EXPECT_EQ(first.get().status, StatusCode::malformed_frame);
+    EXPECT_EQ(second.get().status, StatusCode::malformed_frame);
+    run_future.get();
 }
 
 TEST(ClientConnectionTest, CancelsOneOperationWithoutClosingTheConnection)

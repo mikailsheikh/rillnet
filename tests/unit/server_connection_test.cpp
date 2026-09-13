@@ -38,6 +38,7 @@ using rillnet::has_flag;
 using rillnet::MessageRegistry;
 using rillnet::ServerConnection;
 using rillnet::SessionContext;
+using rillnet::StatusCode;
 using rillnet::StreamId;
 using rillnet::testing::InMemoryTransport;
 
@@ -282,6 +283,35 @@ TEST(ServerConnectionTest, CancelsActiveHandlerWhenTheTransportDisconnects)
     future.get();
     EXPECT_TRUE(handler_saw_disconnect);
     EXPECT_TRUE(transport_ptr->outgoing().empty());
+}
+
+TEST(ServerConnectionTest, SendsStreamErrorForMalformedRequestPayload)
+{
+    boost::asio::io_context context;
+    const auto registry = make_registry();
+    Frame malformed;
+    malformed.header.type = FrameType::request;
+    malformed.header.stream = StreamId{1};
+    malformed.payload = {std::byte{0x01}};
+    malformed.header.payload_size = static_cast<std::uint32_t>(malformed.payload.size());
+    auto transport = std::make_unique<InMemoryTransport>(encode_frame(malformed));
+    auto *transport_ptr = transport.get();
+    ServerConnection connection(context.get_executor(), std::move(transport), registry);
+
+    auto future =
+        boost::asio::co_spawn(context, [&]() { return connection.run(); }, boost::asio::use_future);
+    context.run();
+    future.get();
+
+    FrameDecoder decoder;
+    const auto responses = decoder.push(transport_ptr->outgoing());
+    ASSERT_EQ(responses.size(), 1U);
+    EXPECT_EQ(responses[0].header.stream, StreamId{1});
+    EXPECT_TRUE(has_flag(responses[0].header.flags, FrameFlags::error));
+    EXPECT_TRUE(has_flag(responses[0].header.flags, FrameFlags::end_of_stream));
+    const auto status = rillnet::decode_error_status(responses[0]);
+    ASSERT_TRUE(status.has_value());
+    EXPECT_EQ(*status, StatusCode::decode_error);
 }
 
 } // namespace

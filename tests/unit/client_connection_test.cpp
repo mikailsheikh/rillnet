@@ -528,6 +528,66 @@ TEST(ClientConnectionTest, ResponseWinsWhenItArrivesBeforeCancellation)
     EXPECT_EQ(result.value->id, 42U); // NOLINT(bugprone-unchecked-optional-access)
 }
 
+TEST(ClientConnectionTest, TimesOutARequest)
+{
+    boost::asio::io_context context;
+    const auto registry = make_registry();
+    auto transports = DuplexTransport::make_pair(context.get_executor());
+    auto client_transport = std::move(transports.first);
+    auto *client_transport_ptr = client_transport.get();
+    ClientConnection connection(context.get_executor(), std::move(client_transport), registry);
+
+    auto request_future = boost::asio::co_spawn(
+        context,
+        [&]() -> boost::asio::awaitable<DecodeResult<SimulationStarted>> {
+            auto result = co_await connection.request<StartSimulation, SimulationStarted>(
+                {7}, std::chrono::milliseconds{1});
+            client_transport_ptr->close();
+            co_return result;
+        },
+        boost::asio::use_future);
+    auto run_future =
+        boost::asio::co_spawn(context, [&]() { return connection.run(); }, boost::asio::use_future);
+
+    context.run();
+
+    const auto result = request_future.get();
+    run_future.get();
+    EXPECT_FALSE(result.ok());
+    EXPECT_EQ(result.status, StatusCode::timeout_error);
+
+}
+
+TEST(ClientConnectionTest, ResponseWinsWhenItArrivesBeforeADeadline)
+{
+    boost::asio::io_context context;
+    const auto registry = make_registry();
+    auto transport = std::make_unique<InMemoryTransport>(encode_response_bytes(registry, {42}));
+    const auto *transport_observer = transport.get();
+    ClientConnection connection(context.get_executor(), std::move(transport), registry);
+
+    auto request_future = boost::asio::co_spawn(
+        context,
+        [&]() -> boost::asio::awaitable<DecodeResult<SimulationStarted>> {
+            co_return co_await connection.request<StartSimulation, SimulationStarted>(
+                {7}, std::chrono::seconds{1});
+        },
+        boost::asio::use_future);
+    auto run_future =
+        boost::asio::co_spawn(context, [&]() { return connection.run(); }, boost::asio::use_future);
+
+    context.run();
+
+    const auto result = request_future.get();
+    run_future.get();
+    ASSERT_TRUE(result.ok());
+    ASSERT_TRUE(result.value.has_value());
+    EXPECT_EQ(result.value->id, 42U); // NOLINT(bugprone-unchecked-optional-access)
+
+    FrameDecoder decoder;
+    EXPECT_EQ(decoder.push(transport_observer->outgoing()).size(), 1U);
+}
+
 TEST(ClientConnectionTest, CancelsOneOfTwoConcurrentRequestsThroughTheServer)
 {
     boost::asio::io_context context;
@@ -585,8 +645,7 @@ TEST(ClientConnectionTest, CancelsOneOfTwoConcurrentRequestsThroughTheServer)
             if (successful_result.ok() && successful_result.value.has_value()) {
                 EXPECT_EQ(successful_result.value->id, 2U);
             }
-            boost::system::error_code timer_error;
-            watchdog->cancel(timer_error);
+            watchdog->cancel();
             client_transport_ptr->close();
             server_transport_ptr->close();
         },

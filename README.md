@@ -19,7 +19,7 @@ The library is useful in its current state when you want a small protocol layer 
 - A typed message registry mapping C++ message types to non-zero wire `MessageType` identifiers per protocol version.
 - Typed message payload and frame encoding/decoding, with the wire message type stored as a 4-byte big-endian payload prefix.
 - A FIFO `WriteQueue` that serializes all writes for a connection so concurrent operations never overlap writes on the same transport.
-- `ClientConnection`, which sends typed requests, waits for matching typed responses by stream id, and fails pending requests when the connection closes.
+- `ClientConnection`, which sends typed requests, waits for matching typed responses by stream id, supports relative timeouts and absolute deadlines, and fails pending requests when the connection closes.
 - `ServerConnection`, which dispatches request frames to registered typed asynchronous handlers and writes typed responses through the connection write queue.
 - GoogleTest unit coverage for the implemented public headers and connection behavior.
 

@@ -18,11 +18,13 @@
 #include <boost/asio/experimental/awaitable_operators.hpp>
 #include <boost/asio/experimental/channel.hpp>
 #include <boost/asio/redirect_error.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <boost/asio/use_awaitable.hpp>
 #include <boost/system/error_code.hpp>
 #include <boost/system/system_error.hpp>
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <memory>
 #include <optional>
@@ -45,12 +47,13 @@ template <typename CodecType = PodCodec> class ClientConnection {
 
     struct PendingRequest {
         PendingRequest(boost::asio::any_io_executor executor, StreamId stream)
-            : channel(std::move(executor), 1), operation(stream)
+            : channel(executor, 1), timer(executor), operation(stream)
         {
             (void)operation.activate();
         }
 
         ResponseChannel channel;
+        boost::asio::steady_timer timer;
         Operation operation;
     };
 
@@ -85,6 +88,7 @@ template <typename CodecType = PodCodec> class ClientConnection {
             boost::system::error_code error;
             auto frame = co_await pending_->channel.async_receive(
                 boost::asio::redirect_error(boost::asio::use_awaitable, error));
+            pending_->timer.cancel();
             connection_->pending_.erase(pending_->operation.stream());
 
             if (error) {
@@ -167,6 +171,32 @@ template <typename CodecType = PodCodec> class ClientConnection {
         co_return co_await operation.async_wait();
     }
 
+    template <typename Request, typename Response, typename Rep, typename Period>
+    boost::asio::awaitable<DecodeResult<Response>> request(
+        const Request &value, std::chrono::duration<Rep, Period> timeout)
+    {
+        auto started = co_await start_request<Request, Response>(value, timeout);
+        if (!started.ok()) {
+            co_return DecodeResult<Response>::failure(started.status, started.message);
+        }
+
+        auto operation = std::move(*started.operation);
+        co_return co_await operation.async_wait();
+    }
+
+    template <typename Request, typename Response>
+    boost::asio::awaitable<DecodeResult<Response>> request(const Request &value,
+                                                           Operation::Deadline deadline)
+    {
+        auto started = co_await start_request<Request, Response>(value, deadline);
+        if (!started.ok()) {
+            co_return DecodeResult<Response>::failure(started.status, started.message);
+        }
+
+        auto operation = std::move(*started.operation);
+        co_return co_await operation.async_wait();
+    }
+
     template <typename Request, typename Response>
     boost::asio::awaitable<StartRequestResult<Response>> start_request(const Request &value)
     {
@@ -197,6 +227,35 @@ template <typename CodecType = PodCodec> class ClientConnection {
             RequestOperation<Response>(this, std::move(pending)));
     }
 
+    template <typename Request, typename Response, typename Rep, typename Period>
+    boost::asio::awaitable<StartRequestResult<Response>> start_request(
+        const Request &value, std::chrono::duration<Rep, Period> timeout)
+    {
+        const auto deadline = Operation::Clock::now() +
+                              std::chrono::duration_cast<Operation::Clock::duration>(timeout);
+        co_return co_await start_request<Request, Response>(value, deadline);
+    }
+
+    template <typename Request, typename Response>
+    boost::asio::awaitable<StartRequestResult<Response>> start_request(
+        const Request &value, Operation::Deadline deadline)
+    {
+        auto started = co_await start_request<Request, Response>(value);
+        if (!started.ok()) {
+            co_return started;
+        }
+
+        auto pending = started.operation->pending_;
+        (void)pending->operation.set_deadline(deadline);
+        pending->timer.expires_at(deadline);
+        pending->timer.async_wait([this, pending](const boost::system::error_code &error) {
+            if (!error) {
+                timeout_pending(pending);
+            }
+        });
+        co_return started;
+    }
+
   private:
     boost::asio::awaitable<void> read_loop()
     {
@@ -222,6 +281,7 @@ template <typename CodecType = PodCodec> class ClientConnection {
             (void)stream;
             (void)pending->operation.fail(StatusCode::connection_closed,
                                           "connection closed while awaiting a response");
+            pending->timer.cancel();
             pending->channel.close();
         }
         write_queue_.close();
@@ -244,7 +304,19 @@ template <typename CodecType = PodCodec> class ClientConnection {
         if (!found->second->operation.complete("response received")) {
             return;
         }
+        found->second->timer.cancel();
         found->second->channel.try_send(boost::system::error_code{}, std::move(frame));
+    }
+
+    void timeout_pending(const std::shared_ptr<PendingRequest> &pending)
+    {
+        if (!pending->operation.timeout("operation deadline exceeded")) {
+            return;
+        }
+
+        send_cancellation(pending->operation.stream());
+        pending->channel.close();
+        pending_.erase(pending->operation.stream());
     }
 
     [[nodiscard]] bool cancel_pending(const std::shared_ptr<PendingRequest> &pending,
@@ -254,6 +326,7 @@ template <typename CodecType = PodCodec> class ClientConnection {
             return false;
         }
 
+        pending->timer.cancel();
         send_cancellation(pending->operation.stream());
         pending->channel.close();
         pending_.erase(pending->operation.stream());

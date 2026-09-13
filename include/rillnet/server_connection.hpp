@@ -4,6 +4,7 @@
 #include <rillnet/frame.hpp>
 #include <rillnet/frame_decoder.hpp>
 #include <rillnet/identifiers.hpp>
+#include <rillnet/lifecycle.hpp>
 #include <rillnet/message_codec.hpp>
 #include <rillnet/message_registry.hpp>
 #include <rillnet/operation.hpp>
@@ -16,9 +17,12 @@
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/detached.hpp>
 #include <boost/asio/experimental/awaitable_operators.hpp>
+#include <boost/asio/redirect_error.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <boost/system/system_error.hpp>
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <functional>
 #include <memory>
@@ -72,6 +76,35 @@ template <typename CodecType = PodCodec> class ServerConnection {
     ServerConnection(const ServerConnection &) = delete;
     ServerConnection &operator=(const ServerConnection &) = delete;
 
+    [[nodiscard]] ConnectionState state() const noexcept { return lifecycle_.state(); }
+
+    // Stops accepting new requests, allows active handlers to finish, and closes the transport
+    // after the drain period expires.
+    template <typename Rep, typename Period>
+    boost::asio::awaitable<void> shutdown(std::chrono::duration<Rep, Period> drain_period)
+    {
+        begin_shutdown();
+        const auto deadline = Operation::Clock::now() +
+                              std::chrono::duration_cast<Operation::Clock::duration>(drain_period);
+        boost::asio::steady_timer timer(executor_);
+        while (active_handlers_ != 0 && Operation::Clock::now() < deadline) {
+            timer.expires_after(std::chrono::milliseconds(1));
+            boost::system::error_code error;
+            co_await timer.async_wait(
+                boost::asio::redirect_error(boost::asio::use_awaitable, error));
+            if (error) {
+                break;
+            }
+        }
+
+        if (active_handlers_ != 0) {
+            fail_operations_on_connection_close();
+        }
+        transport_->close();
+        lifecycle_.transition(ConnectionState::closed);
+        co_return;
+    }
+
     // Registers a handler for Request. Handler must be invocable as
     // `awaitable<Response>(SessionContext&, Request)` and replaces any handler already registered
     // for Request's wire message type.
@@ -107,6 +140,10 @@ template <typename CodecType = PodCodec> class ServerConnection {
     // Drives the connection's write queue and read loop until the transport is closed or fails.
     boost::asio::awaitable<void> run()
     {
+        if (lifecycle_.state() == ConnectionState::created) {
+            (void)lifecycle_.transition(ConnectionState::accepting);
+            (void)lifecycle_.transition(ConnectionState::active);
+        }
         using namespace boost::asio::experimental::awaitable_operators;
         co_await (write_queue_.run() && read_loop());
     }
@@ -162,6 +199,13 @@ template <typename CodecType = PodCodec> class ServerConnection {
 
     void dispatch(Frame frame)
     {
+        if (lifecycle_.state() == ConnectionState::draining ||
+            lifecycle_.state() == ConnectionState::closing ||
+            lifecycle_.state() == ConnectionState::closed) {
+            send_operation_error(frame.header.stream, StatusCode::connection_closed);
+            mark_terminal(frame);
+            return;
+        }
         if (frame.header.type != FrameType::request) {
             transport_->close();
             return;
@@ -242,6 +286,17 @@ template <typename CodecType = PodCodec> class ServerConnection {
         }
     }
 
+    void begin_shutdown() noexcept
+    {
+        if (lifecycle_.state() == ConnectionState::created) {
+            (void)lifecycle_.transition(ConnectionState::accepting);
+            (void)lifecycle_.transition(ConnectionState::active);
+        }
+        if (lifecycle_.state() == ConnectionState::active) {
+            (void)lifecycle_.transition(ConnectionState::draining);
+        }
+    }
+
     boost::asio::any_io_executor executor_;
     std::unique_ptr<Transport> transport_;
     const MessageRegistry<CodecType> &registry_;
@@ -252,6 +307,7 @@ template <typename CodecType = PodCodec> class ServerConnection {
     std::unordered_set<StreamId> terminal_streams_;
     std::size_t active_handlers_ = 0;
     bool reading_ = true;
+    ConnectionLifecycle lifecycle_;
 };
 
 } // namespace rillnet

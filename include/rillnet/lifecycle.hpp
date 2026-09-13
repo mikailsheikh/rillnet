@@ -9,6 +9,7 @@ enum class ConnectionState : std::uint8_t {
     connecting,
     accepting,
     active,
+    draining,
     closing,
     closed,
 };
@@ -35,6 +36,9 @@ enum class LifecycleTransitionError : std::uint8_t {
     case ConnectionState::accepting:
         return to == ConnectionState::active;
     case ConnectionState::active:
+        return to == ConnectionState::draining || to == ConnectionState::closing ||
+               to == ConnectionState::closed;
+    case ConnectionState::draining:
         return to == ConnectionState::closing || to == ConnectionState::closed;
     case ConnectionState::closing:
         return to == ConnectionState::closed;

@@ -314,4 +314,27 @@ TEST(ServerConnectionTest, SendsStreamErrorForMalformedRequestPayload)
     EXPECT_EQ(*status, StatusCode::decode_error);
 }
 
+TEST(ServerConnectionTest, GracefulShutdownClosesAnIdleConnection)
+{
+    boost::asio::io_context context;
+    const auto registry = make_registry();
+    auto transports = rillnet::testing::DuplexTransport::make_pair(context.get_executor());
+    ServerConnection connection(context.get_executor(), std::move(transports.first), registry);
+
+    auto shutdown_future = boost::asio::co_spawn(
+        context,
+        [&]() -> boost::asio::awaitable<void> {
+            co_await connection.shutdown(std::chrono::milliseconds{1});
+            EXPECT_EQ(connection.state(), rillnet::ConnectionState::closed);
+        },
+        boost::asio::use_future);
+    auto run_future =
+        boost::asio::co_spawn(context, [&]() { return connection.run(); }, boost::asio::use_future);
+
+    context.run();
+
+    shutdown_future.get();
+    run_future.get();
+}
+
 } // namespace

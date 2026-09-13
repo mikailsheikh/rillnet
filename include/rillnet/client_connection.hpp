@@ -5,6 +5,7 @@
 #include <rillnet/frame_decoder.hpp>
 #include <rillnet/frame_flags.hpp>
 #include <rillnet/identifiers.hpp>
+#include <rillnet/lifecycle.hpp>
 #include <rillnet/message_codec.hpp>
 #include <rillnet/message_registry.hpp>
 #include <rillnet/operation.hpp>
@@ -179,11 +180,44 @@ template <typename CodecType = PodCodec> class ClientConnection {
     ClientConnection(const ClientConnection &) = delete;
     ClientConnection &operator=(const ClientConnection &) = delete;
 
+    [[nodiscard]] ConnectionState state() const noexcept { return lifecycle_.state(); }
+
+    // Stops accepting new requests, waits for pending responses, and closes the transport when
+    // the drain period expires. The connection remains usable for responses while draining.
+    template <typename Rep, typename Period>
+    boost::asio::awaitable<void> shutdown(std::chrono::duration<Rep, Period> drain_period)
+    {
+        begin_shutdown();
+        const auto deadline = Operation::Clock::now() +
+                              std::chrono::duration_cast<Operation::Clock::duration>(drain_period);
+        boost::asio::steady_timer timer(executor_);
+        while (!pending_.empty() && Operation::Clock::now() < deadline) {
+            timer.expires_after(std::chrono::milliseconds(1));
+            boost::system::error_code error;
+            co_await timer.async_wait(
+                boost::asio::redirect_error(boost::asio::use_awaitable, error));
+            if (error) {
+                break;
+            }
+        }
+
+        if (!pending_.empty()) {
+            fail_pending(StatusCode::connection_closed, "connection drain period expired");
+        }
+        transport_->close();
+        lifecycle_.transition(ConnectionState::closed);
+        co_return;
+    }
+
     // Drives the connection's write queue and read loop until the transport is closed or fails.
     // Every request registered with this connection is failed with connection_closed once run()
     // returns.
     boost::asio::awaitable<void> run()
     {
+        if (lifecycle_.state() == ConnectionState::created) {
+            (void)lifecycle_.transition(ConnectionState::connecting);
+            (void)lifecycle_.transition(ConnectionState::active);
+        }
         using namespace boost::asio::experimental::awaitable_operators;
         co_await (write_queue_.run() && read_loop());
     }
@@ -236,6 +270,11 @@ template <typename CodecType = PodCodec> class ClientConnection {
     template <typename Request, typename Response>
     boost::asio::awaitable<StartRequestResult<Response>> start_request(const Request &value)
     {
+        if (state() == ConnectionState::draining || state() == ConnectionState::closing ||
+            state() == ConnectionState::closed) {
+            co_return StartRequestResult<Response>::failure(StatusCode::connection_closed,
+                                                            "connection is shutting down");
+        }
         const auto allocation = stream_ids_.allocate();
         if (!allocation.ok()) {
             co_return StartRequestResult<Response>::failure(allocation.status(),
@@ -322,14 +361,9 @@ template <typename CodecType = PodCodec> class ClientConnection {
             }
         }
 
-        while (!pending_.empty()) {
-            auto pending = pending_.begin()->second;
-            (void)pending->operation.fail(StatusCode::connection_closed,
-                                          "connection closed while awaiting a response");
-            pending->channel.close();
-            cleanup_pending(pending, false);
-        }
+        fail_pending(StatusCode::connection_closed, "connection closed while awaiting a response");
         write_queue_.close();
+        lifecycle_.transition(ConnectionState::closed);
     }
 
     void dispatch(Frame frame)
@@ -385,13 +419,29 @@ template <typename CodecType = PodCodec> class ClientConnection {
 
     void fail_connection(StatusCode status, std::string message)
     {
+        fail_pending(status, std::move(message));
+        transport_->close();
+    }
+
+    void begin_shutdown() noexcept
+    {
+        if (lifecycle_.state() == ConnectionState::created) {
+            (void)lifecycle_.transition(ConnectionState::connecting);
+            (void)lifecycle_.transition(ConnectionState::active);
+        }
+        if (lifecycle_.state() == ConnectionState::active) {
+            (void)lifecycle_.transition(ConnectionState::draining);
+        }
+    }
+
+    void fail_pending(StatusCode status, std::string message)
+    {
         while (!pending_.empty()) {
             auto pending = pending_.begin()->second;
             (void)pending->operation.fail(status, message);
             pending->channel.close();
             cleanup_pending(pending, false);
         }
-        transport_->close();
     }
 
     void timeout_pending(const std::shared_ptr<PendingRequest> &pending)
@@ -465,6 +515,7 @@ template <typename CodecType = PodCodec> class ClientConnection {
     FrameDecoder decoder_;
     std::unordered_map<StreamId, std::shared_ptr<PendingRequest>> pending_;
     std::unordered_set<StreamId> terminal_streams_;
+    ConnectionLifecycle lifecycle_;
 };
 
 } // namespace rillnet

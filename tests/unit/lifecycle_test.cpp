@@ -28,6 +28,12 @@ void advance_to(rillnet::ConnectionLifecycle &lifecycle, ConnectionState state)
                   LifecycleTransitionError::none);
         ASSERT_EQ(lifecycle.transition(ConnectionState::active), LifecycleTransitionError::none);
         return;
+    case ConnectionState::draining:
+        ASSERT_EQ(lifecycle.transition(ConnectionState::connecting),
+                  LifecycleTransitionError::none);
+        ASSERT_EQ(lifecycle.transition(ConnectionState::active), LifecycleTransitionError::none);
+        ASSERT_EQ(lifecycle.transition(ConnectionState::draining), LifecycleTransitionError::none);
+        return;
     case ConnectionState::closing:
         ASSERT_EQ(lifecycle.transition(ConnectionState::connecting),
                   LifecycleTransitionError::none);
@@ -48,7 +54,8 @@ TEST(ConnectionLifecycleTest, AcceptsOnlySpecifiedTransitions)
 {
     constexpr std::array states{ConnectionState::created,   ConnectionState::connecting,
                                 ConnectionState::accepting, ConnectionState::active,
-                                ConnectionState::closing,   ConnectionState::closed};
+                                ConnectionState::draining,  ConnectionState::closing,
+                                ConnectionState::closed};
 
     for (const auto from : states) {
         for (const auto to : states) {

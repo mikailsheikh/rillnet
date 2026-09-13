@@ -655,6 +655,46 @@ TEST(ClientConnectionTest, ResponseWinsWhenItArrivesBeforeADeadline)
     EXPECT_EQ(decoder.push(transport_observer->outgoing()).size(), 1U);
 }
 
+TEST(ClientConnectionTest, GracefulShutdownRejectsRequestsAndHonorsDrainDeadline)
+{
+    boost::asio::io_context context;
+    const auto registry = make_registry();
+    auto transports = DuplexTransport::make_pair(context.get_executor());
+    ClientConnection connection(context.get_executor(), std::move(transports.first), registry);
+
+    auto shutdown_future = boost::asio::co_spawn(
+        context,
+        [&]() -> boost::asio::awaitable<void> {
+            auto started =
+                co_await connection.start_request<StartSimulation, SimulationStarted>({7});
+            EXPECT_TRUE(started.ok());
+            if (!started.ok()) {
+                co_return;
+            }
+
+            auto operation = std::move(*started.operation);
+            co_await connection.shutdown(std::chrono::milliseconds{1});
+            EXPECT_EQ(connection.state(), rillnet::ConnectionState::closed);
+
+            const auto completed = co_await operation.async_wait();
+            EXPECT_FALSE(completed.ok());
+            EXPECT_EQ(completed.status, StatusCode::connection_closed);
+
+            const auto rejected =
+                co_await connection.request<StartSimulation, SimulationStarted>({8});
+            EXPECT_FALSE(rejected.ok());
+            EXPECT_EQ(rejected.status, StatusCode::connection_closed);
+        },
+        boost::asio::use_future);
+    auto run_future =
+        boost::asio::co_spawn(context, [&]() { return connection.run(); }, boost::asio::use_future);
+
+    context.run();
+
+    shutdown_future.get();
+    run_future.get();
+}
+
 TEST(ClientConnectionTest, CancelsOneOfTwoConcurrentRequestsThroughTheServer)
 {
     boost::asio::io_context context;

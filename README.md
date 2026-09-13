@@ -19,8 +19,8 @@ The library is useful in its current state when you want a small protocol layer 
 - A typed message registry mapping C++ message types to non-zero wire `MessageType` identifiers per protocol version.
 - Typed message payload and frame encoding/decoding, with the wire message type stored as a 4-byte big-endian payload prefix.
 - A FIFO `WriteQueue` that serializes all writes for a connection so concurrent operations never overlap writes on the same transport.
-- `ClientConnection`, which sends typed requests, waits for matching typed responses by stream id, supports relative timeouts and absolute deadlines, and fails pending requests when the connection closes.
-- `ServerConnection`, which dispatches request frames to registered typed asynchronous handlers and writes typed responses through the connection write queue.
+- `ClientConnection`, which sends typed requests, waits for matching typed responses by stream id, supports relative timeouts and absolute deadlines, fails pending requests when the connection closes, and supports bounded graceful shutdown.
+- `ServerConnection`, which dispatches request frames to registered typed asynchronous handlers, writes typed responses through the connection write queue, and supports bounded graceful shutdown.
 - GoogleTest unit coverage for the implemented public headers and connection behavior.
 
 ## Build Requirements
@@ -62,3 +62,11 @@ ctest --preset tsan
 Applications define message types, register each type with a `MessageRegistry`, provide or select a codec, then run a connection object on a Boost.Asio executor. Client code uses `ClientConnection::request<Request, Response>()`; server code registers handlers with `ServerConnection::handle<Request>()`, where each handler returns an awaitable response type.
 
 The transport-facing layer works in frames and bytes. The application-facing layer works in typed request and response values.
+
+## Graceful Shutdown
+
+Call `shutdown(duration)` on a client or server connection to enter the draining state. New client
+requests are rejected, while existing client requests and server handlers are allowed to finish.
+When the duration expires, unfinished work is completed with `StatusCode::connection_closed` and
+the transport is closed. The operation is awaitable and returns after the connection reaches the
+closed state.

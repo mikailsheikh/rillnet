@@ -14,8 +14,8 @@
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/io_context.hpp>
-#include <boost/asio/redirect_error.hpp>
 #include <boost/asio/post.hpp>
+#include <boost/asio/redirect_error.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include <boost/asio/strand.hpp>
 #include <boost/asio/use_future.hpp>
@@ -42,12 +42,12 @@ using rillnet::FrameFlags;
 using rillnet::FrameType;
 using rillnet::has_flag;
 using rillnet::MessageRegistry;
-using rillnet::StatusCode;
-using rillnet::StreamId;
 using rillnet::ServerConnection;
 using rillnet::SessionContext;
-using rillnet::testing::InMemoryTransport;
+using rillnet::StatusCode;
+using rillnet::StreamId;
 using rillnet::testing::DuplexTransport;
+using rillnet::testing::InMemoryTransport;
 
 struct StartSimulation {
     std::uint32_t id = 0;
@@ -353,6 +353,41 @@ TEST(ClientConnectionTest, RequestFailsImmediatelyForAnUnregisteredMessageType)
     EXPECT_EQ(result.status, StatusCode::unknown_message_type);
 }
 
+TEST(ClientConnectionTest, ReusesStreamIdentifierAfterTerminalResultIsConsumed)
+{
+    boost::asio::io_context context;
+    const auto registry = make_registry();
+    ClientConnection connection(context.get_executor(),
+                                std::make_unique<InMemoryTransport>(std::vector<std::byte>{}),
+                                registry, {}, 1);
+
+    auto future = boost::asio::co_spawn(
+        context,
+        [&]() -> boost::asio::awaitable<void> {
+            auto first = co_await connection.start_request<StartSimulation, SimulationStarted>({1});
+            EXPECT_TRUE(first.ok());
+            if (!first.ok()) {
+                co_return;
+            }
+            auto operation = std::move(*first.operation);
+            EXPECT_TRUE(operation.cancel());
+            const auto result = co_await operation.async_wait();
+            EXPECT_EQ(result.status, StatusCode::cancelled);
+
+            auto second =
+                co_await connection.start_request<StartSimulation, SimulationStarted>({2});
+            EXPECT_TRUE(second.ok());
+            if (!second.ok()) {
+                co_return;
+            }
+            EXPECT_EQ(second.operation->stream(), StreamId{1});
+        },
+        boost::asio::use_future);
+
+    context.run();
+    future.get();
+}
+
 TEST(ClientConnectionTest, RequestFailsWithConnectionClosedWhenTheTransportClosesFirst)
 {
     boost::asio::io_context context;
@@ -555,7 +590,6 @@ TEST(ClientConnectionTest, TimesOutARequest)
     run_future.get();
     EXPECT_FALSE(result.ok());
     EXPECT_EQ(result.status, StatusCode::timeout_error);
-
 }
 
 TEST(ClientConnectionTest, ResponseWinsWhenItArrivesBeforeADeadline)
@@ -605,9 +639,9 @@ TEST(ClientConnectionTest, CancelsOneOfTwoConcurrentRequestsThroughTheServer)
     std::size_t handled_requests = 0;
 
     server.handle<StartSimulation>(
-        [&context, &cancellation_observed, &handled_requests](SessionContext &session,
-                                                              StartSimulation request)
-            -> boost::asio::awaitable<SimulationStarted> {
+        [&context, &cancellation_observed,
+         &handled_requests](SessionContext &session,
+                            StartSimulation request) -> boost::asio::awaitable<SimulationStarted> {
             ++handled_requests;
             if (request.id == 1) {
                 boost::asio::steady_timer timer(context);
@@ -654,8 +688,8 @@ TEST(ClientConnectionTest, CancelsOneOfTwoConcurrentRequestsThroughTheServer)
         context,
         [watchdog, client_transport_ptr, server_transport_ptr]() -> boost::asio::awaitable<void> {
             boost::system::error_code error;
-            co_await watchdog->async_wait(boost::asio::redirect_error(
-                boost::asio::use_awaitable, error));
+            co_await watchdog->async_wait(
+                boost::asio::redirect_error(boost::asio::use_awaitable, error));
             if (!error) {
                 client_transport_ptr->close();
                 server_transport_ptr->close();

@@ -26,6 +26,7 @@
 #include <array>
 #include <chrono>
 #include <cstddef>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -55,12 +56,42 @@ template <typename CodecType = PodCodec> class ClientConnection {
         ResponseChannel channel;
         boost::asio::steady_timer timer;
         Operation operation;
+        bool removed = false;
+        bool stream_released = false;
     };
 
   public:
     template <typename Response> class RequestOperation {
       public:
         RequestOperation() = default;
+
+        ~RequestOperation()
+        {
+            if (connection_ != nullptr && pending_) {
+                connection_->discard_pending(pending_);
+            }
+        }
+
+        RequestOperation(RequestOperation &&other) noexcept
+            : connection_(std::exchange(other.connection_, nullptr)),
+              pending_(std::move(other.pending_))
+        {
+        }
+
+        RequestOperation &operator=(RequestOperation &&other) noexcept
+        {
+            if (this != &other) {
+                if (connection_ != nullptr && pending_) {
+                    connection_->discard_pending(pending_);
+                }
+                connection_ = std::exchange(other.connection_, nullptr);
+                pending_ = std::move(other.pending_);
+            }
+            return *this;
+        }
+
+        RequestOperation(const RequestOperation &) = delete;
+        RequestOperation &operator=(const RequestOperation &) = delete;
 
         [[nodiscard]] StreamId stream() const noexcept
         {
@@ -88,11 +119,11 @@ template <typename CodecType = PodCodec> class ClientConnection {
             boost::system::error_code error;
             auto frame = co_await pending_->channel.async_receive(
                 boost::asio::redirect_error(boost::asio::use_awaitable, error));
-            pending_->timer.cancel();
-            connection_->pending_.erase(pending_->operation.stream());
+            const auto pending = pending_;
+            connection_->cleanup_pending(pending, true);
 
             if (error) {
-                const auto &result = pending_->operation.result();
+                const auto &result = pending->operation.result();
                 if (result.has_value()) {
                     co_return DecodeResult<Response>::failure(result->status(), result->message());
                 }
@@ -134,11 +165,12 @@ template <typename CodecType = PodCodec> class ClientConnection {
     };
 
     ClientConnection(boost::asio::any_io_executor executor, std::unique_ptr<Transport> transport,
-                const MessageRegistry<CodecType> &registry,
-                WriteQueueLimits write_queue_limits = {})
+                     const MessageRegistry<CodecType> &registry,
+                     WriteQueueLimits write_queue_limits = {},
+                     std::uint64_t maximum_stream_id = std::numeric_limits<std::uint64_t>::max())
         : executor_(std::move(executor)), transport_(std::move(transport)), registry_(registry),
-           write_queue_(executor_, *transport_, write_queue_limits),
-           stream_ids_(StreamInitiator::client)
+          write_queue_(executor_, *transport_, write_queue_limits),
+          stream_ids_(StreamInitiator::client, maximum_stream_id)
     {
     }
 
@@ -174,8 +206,8 @@ template <typename CodecType = PodCodec> class ClientConnection {
     }
 
     template <typename Request, typename Response, typename Rep, typename Period>
-    boost::asio::awaitable<DecodeResult<Response>> request(
-        const Request &value, std::chrono::duration<Rep, Period> timeout)
+    boost::asio::awaitable<DecodeResult<Response>>
+    request(const Request &value, std::chrono::duration<Rep, Period> timeout)
     {
         auto started = co_await start_request<Request, Response>(value, timeout);
         if (!started.ok()) {
@@ -221,7 +253,7 @@ template <typename CodecType = PodCodec> class ClientConnection {
         if (!sent.ok()) {
             (void)pending->operation.fail(sent.status, sent.message);
             pending->channel.close();
-            pending_.erase(stream);
+            cleanup_pending(pending, true);
             co_return StartRequestResult<Response>::failure(sent.status, sent.message);
         }
 
@@ -230,8 +262,8 @@ template <typename CodecType = PodCodec> class ClientConnection {
     }
 
     template <typename Request, typename Response, typename Rep, typename Period>
-    boost::asio::awaitable<StartRequestResult<Response>> start_request(
-        const Request &value, std::chrono::duration<Rep, Period> timeout)
+    boost::asio::awaitable<StartRequestResult<Response>>
+    start_request(const Request &value, std::chrono::duration<Rep, Period> timeout)
     {
         const auto deadline = Operation::Clock::now() +
                               std::chrono::duration_cast<Operation::Clock::duration>(timeout);
@@ -239,8 +271,8 @@ template <typename CodecType = PodCodec> class ClientConnection {
     }
 
     template <typename Request, typename Response>
-    boost::asio::awaitable<StartRequestResult<Response>> start_request(
-        const Request &value, Operation::Deadline deadline)
+    boost::asio::awaitable<StartRequestResult<Response>> start_request(const Request &value,
+                                                                       Operation::Deadline deadline)
     {
         auto started = co_await start_request<Request, Response>(value);
         if (!started.ok()) {
@@ -279,12 +311,12 @@ template <typename CodecType = PodCodec> class ClientConnection {
             }
         }
 
-        for (auto &[stream, pending] : pending_) {
-            (void)stream;
+        while (!pending_.empty()) {
+            auto pending = pending_.begin()->second;
             (void)pending->operation.fail(StatusCode::connection_closed,
                                           "connection closed while awaiting a response");
-            pending->timer.cancel();
             pending->channel.close();
+            cleanup_pending(pending, false);
         }
         write_queue_.close();
     }
@@ -303,11 +335,13 @@ template <typename CodecType = PodCodec> class ClientConnection {
             (void)cancel_pending(found->second, "operation cancelled by peer");
             return;
         }
-        if (!found->second->operation.complete("response received")) {
+        const auto pending = found->second;
+        if (!pending->operation.complete("response received")) {
             return;
         }
-        found->second->timer.cancel();
-        found->second->channel.try_send(boost::system::error_code{}, std::move(frame));
+        pending->timer.cancel();
+        pending->channel.try_send(boost::system::error_code{}, std::move(frame));
+        cleanup_pending(pending, true);
     }
 
     void timeout_pending(const std::shared_ptr<PendingRequest> &pending)
@@ -318,7 +352,7 @@ template <typename CodecType = PodCodec> class ClientConnection {
 
         send_cancellation(pending->operation.stream());
         pending->channel.close();
-        pending_.erase(pending->operation.stream());
+        cleanup_pending(pending, false);
     }
 
     [[nodiscard]] bool cancel_pending(const std::shared_ptr<PendingRequest> &pending,
@@ -328,11 +362,38 @@ template <typename CodecType = PodCodec> class ClientConnection {
             return false;
         }
 
-        pending->timer.cancel();
         send_cancellation(pending->operation.stream());
         pending->channel.close();
-        pending_.erase(pending->operation.stream());
+        cleanup_pending(pending, false);
         return true;
+    }
+
+    void discard_pending(const std::shared_ptr<PendingRequest> &pending)
+    {
+        if (!pending->operation.is_terminal()) {
+            (void)pending->operation.cancel("operation handle released");
+            send_cancellation(pending->operation.stream());
+            pending->channel.close();
+        }
+        cleanup_pending(pending, true);
+    }
+
+    void cleanup_pending(const std::shared_ptr<PendingRequest> &pending,
+                         bool release_stream) noexcept
+    {
+        if (!pending->removed) {
+            pending->removed = true;
+            pending->timer.cancel();
+            const auto stream = pending->operation.stream();
+            const auto found = pending_.find(stream);
+            if (found != pending_.end() && found->second == pending) {
+                pending_.erase(found);
+            }
+        }
+        if (release_stream && !pending->stream_released) {
+            pending->stream_released = true;
+            stream_ids_.release(pending->operation.stream());
+        }
     }
 
     void send_cancellation(StreamId stream)

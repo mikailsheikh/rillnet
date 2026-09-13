@@ -59,6 +59,21 @@ TEST(StreamIdAllocatorTest, ExhaustionDoesNotWrapOrReuseIdentifiers)
     EXPECT_EQ(allocator.maximum(), StreamId{1});
 }
 
+TEST(StreamIdAllocatorTest, ReleasesIdentifiersForReuseExactlyOnce)
+{
+    StreamIdAllocator allocator(StreamInitiator::client, 1);
+
+    const auto allocation = allocator.allocate();
+    ASSERT_TRUE(allocation.ok());
+    allocator.release(*allocation.stream());
+    allocator.release(*allocation.stream());
+
+    const auto reused = allocator.allocate();
+    ASSERT_TRUE(reused.ok());
+    EXPECT_EQ(*reused.stream(), StreamId{1});
+    EXPECT_FALSE(allocator.allocate().ok());
+}
+
 TEST(StreamIdAllocatorTest, HonorsTheFullRangeWithoutOverflowing)
 {
     StreamIdAllocator client(StreamInitiator::client);

@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <set>
 
 namespace rillnet {
 
@@ -40,8 +41,6 @@ class StreamIdAllocation {
     StatusCode status_;
 };
 
-// Stream IDs are never reused during an allocator's lifetime. This prevents a delayed frame for a
-// completed operation from being miscorrelated with a newer operation on the same connection.
 class StreamIdAllocator {
   public:
     explicit StreamIdAllocator(
@@ -57,18 +56,37 @@ class StreamIdAllocator {
 
     [[nodiscard]] StreamIdAllocation allocate() noexcept
     {
+        if (!available_.empty()) {
+            const auto value = *available_.begin();
+            available_.erase(available_.begin());
+            in_use_.insert(value);
+            return StreamIdAllocation::success(StreamId{value});
+        }
+
         if (next_ == 0 || next_ > maximum_) {
             next_ = 0;
             return StreamIdAllocation::exhausted();
         }
 
         const StreamId stream{next_};
+        in_use_.insert(stream.value());
         if (maximum_ - next_ < 2) {
             next_ = 0;
         } else {
             next_ += 2;
         }
         return StreamIdAllocation::success(stream);
+    }
+
+    void release(StreamId stream) noexcept
+    {
+        const auto value = stream.value();
+        if (value == 0 || value > maximum_ || value % 2 != first_id(initiator_) % 2) {
+            return;
+        }
+        if (in_use_.erase(value) != 0) {
+            available_.insert(value);
+        }
     }
 
   private:
@@ -89,6 +107,8 @@ class StreamIdAllocator {
     StreamInitiator initiator_;
     std::uint64_t next_;
     std::uint64_t maximum_;
+    std::set<std::uint64_t> in_use_;
+    std::set<std::uint64_t> available_;
 };
 
 } // namespace rillnet

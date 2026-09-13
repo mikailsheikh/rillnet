@@ -10,6 +10,7 @@ add_executable(rillnet_unit_tests
   message_registry_test.cpp
   message_codec_test.cpp
   error_test.cpp
+  protocol_violation_test.cpp
   lifecycle_test.cpp
   operation_test.cpp
   stream_id_allocator_test.cpp
@@ -21,6 +22,7 @@ add_executable(rillnet_unit_tests
   write_queue_test.cpp
   client_connection_test.cpp
   server_connection_test.cpp
+  diagnostics_test.cpp
 )
 
 target_link_libraries(rillnet_unit_tests

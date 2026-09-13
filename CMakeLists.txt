@@ -29,6 +29,8 @@ set(rillnet_format_sources
   include/rillnet/message_registry.hpp
   include/rillnet/message_codec.hpp
   include/rillnet/error.hpp
+  include/rillnet/diagnostics.hpp
+  include/rillnet/protocol_violation.hpp
   include/rillnet/lifecycle.hpp
   include/rillnet/operation.hpp
   include/rillnet/stream_id_allocator.hpp
@@ -52,6 +54,7 @@ set(rillnet_format_sources
   tests/unit/message_registry_test.cpp
   tests/unit/message_codec_test.cpp
   tests/unit/error_test.cpp
+  tests/unit/protocol_violation_test.cpp
   tests/unit/lifecycle_test.cpp
   tests/unit/operation_test.cpp
   tests/unit/stream_id_allocator_test.cpp
@@ -64,6 +67,7 @@ set(rillnet_format_sources
   tests/unit/in_memory_transport.hpp
   tests/unit/client_connection_test.cpp
   tests/unit/server_connection_test.cpp
+  tests/unit/diagnostics_test.cpp
 )
 
 set(rillnet_clang_tidy_sources ${rillnet_format_sources})

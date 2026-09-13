@@ -1,5 +1,8 @@
 #pragma once
 
+#include <rillnet/frame.hpp>
+#include <rillnet/frame_codec.hpp>
+#include <rillnet/frame_decoder.hpp>
 #include <rillnet/transport.hpp>
 
 #include <boost/asio/experimental/channel.hpp>
@@ -9,8 +12,11 @@
 #include <boost/system/system_error.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
+#include <deque>
 #include <memory>
+#include <optional>
 #include <span>
 #include <utility>
 #include <vector>
@@ -79,10 +85,9 @@ class DuplexTransport final : public rillnet::Transport {
     {
         auto first_endpoint = std::make_shared<Endpoint>(executor);
         auto second_endpoint = std::make_shared<Endpoint>(std::move(executor));
-        return {std::unique_ptr<DuplexTransport>(
-                    new DuplexTransport(first_endpoint, second_endpoint)),
-                std::unique_ptr<DuplexTransport>(
-                    new DuplexTransport(second_endpoint, first_endpoint))};
+        return {
+            std::unique_ptr<DuplexTransport>(new DuplexTransport(first_endpoint, second_endpoint)),
+            std::unique_ptr<DuplexTransport>(new DuplexTransport(second_endpoint, first_endpoint))};
     }
 
     boost::asio::awaitable<std::size_t> read(std::span<std::byte> buffer) override
@@ -140,6 +145,59 @@ class DuplexTransport final : public rillnet::Transport {
     std::vector<std::byte> pending_;
     std::size_t pending_offset_ = 0;
     bool open_ = true;
+};
+
+// Drives the far end of a DuplexTransport pair at frame granularity, so a test can script the
+// exact order in which frames cross a connection: every send() is observable by the peer before
+// the test decides what to send next. receive() reports end-of-stream as std::nullopt.
+class FramePeer {
+  public:
+    explicit FramePeer(std::unique_ptr<rillnet::Transport> transport)
+        : transport_(std::move(transport))
+    {
+    }
+
+    boost::asio::awaitable<std::optional<rillnet::Frame>> receive()
+    {
+        while (frames_.empty()) {
+            std::array<std::byte, 4096> buffer{};
+            std::size_t bytes_read = 0;
+            try {
+                bytes_read = co_await transport_->read(buffer);
+            } catch (const boost::system::system_error &) {
+                co_return std::nullopt;
+            }
+            if (bytes_read == 0) {
+                co_return std::nullopt;
+            }
+            for (auto &frame : decoder_.push(std::span(buffer).first(bytes_read))) {
+                frames_.push_back(std::move(frame));
+            }
+        }
+
+        auto frame = std::move(frames_.front());
+        frames_.pop_front();
+        co_return frame;
+    }
+
+    // Returns false once the far end has gone away, so a scripted peer can stop rather than
+    // propagate a transport exception out of the test.
+    boost::asio::awaitable<bool> send(const rillnet::Frame &frame)
+    {
+        try {
+            co_await transport_->write(rillnet::encode_frame(frame));
+        } catch (const boost::system::system_error &) {
+            co_return false;
+        }
+        co_return true;
+    }
+
+    void close() noexcept { transport_->close(); }
+
+  private:
+    std::unique_ptr<rillnet::Transport> transport_;
+    rillnet::FrameDecoder decoder_;
+    std::deque<rillnet::Frame> frames_;
 };
 
 } // namespace rillnet::testing

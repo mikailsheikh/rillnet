@@ -176,6 +176,38 @@ TEST(WriteQueueTest, RejectsFramesWhenByteCapacityIsFull)
     EXPECT_EQ(result.status, StatusCode::resource_limit_exceeded);
 }
 
+TEST(WriteQueueTest, EnqueueWaitsForCapacityAndPreservesFrame)
+{
+    boost::asio::io_context context;
+    RecordingTransport transport;
+    rillnet::WriteQueue queue(context.get_executor(), transport, {.max_frames = 1});
+
+    ASSERT_TRUE(queue.try_enqueue(make_frame(1, 1)).ok());
+    bool producer_resumed = false;
+
+    auto producer_future = boost::asio::co_spawn(
+        context,
+        [&]() -> boost::asio::awaitable<void> {
+            const auto result = co_await queue.enqueue(make_frame(3, 3));
+            EXPECT_TRUE(result.ok());
+            producer_resumed = true;
+            queue.close();
+        },
+        boost::asio::use_future);
+    context.poll();
+    EXPECT_FALSE(producer_resumed);
+
+    auto run_future =
+        boost::asio::co_spawn(context, [&]() { return queue.run(); }, boost::asio::use_future);
+
+    context.run();
+
+    producer_future.get();
+    EXPECT_TRUE(run_future.get().ok());
+    EXPECT_TRUE(producer_resumed);
+    EXPECT_EQ(transport.writes_, (std::vector<StreamId>{StreamId{1}, StreamId{3}}));
+}
+
 TEST(WriteQueueTest, TransportWriteFailureStopsRunAndReportsFailure)
 {
     boost::asio::io_context context;

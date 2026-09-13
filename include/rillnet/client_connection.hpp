@@ -217,7 +217,7 @@ template <typename CodecType = PodCodec> class ClientConnection {
         auto pending = std::make_shared<PendingRequest>(executor_, stream);
         pending_.emplace(stream, pending);
 
-        const auto sent = write_queue_.try_enqueue(std::move(*encoded.frame));
+        const auto sent = co_await write_queue_.enqueue(std::move(*encoded.frame));
         if (!sent.ok()) {
             (void)pending->operation.fail(sent.status, sent.message);
             pending->channel.close();

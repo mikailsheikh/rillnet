@@ -76,21 +76,11 @@ class WriteQueue {
 
     // Enqueues a frame for writing, preserving FIFO order relative to every other enqueue() call.
     // Returns once the frame has been accepted into the queue, which is not the same as having
-    // been written to the transport yet. Reports resource_limit_exceeded if the queue is closed,
-    // the frame is too large, or a bounded capacity is full.
+    // been written to the transport yet. Waits for bounded capacity to become available and
+    // reports resource_limit_exceeded if the queue is closed or the frame is too large.
     [[nodiscard]] WriteResult try_enqueue(Frame frame)
     {
-        const auto bytes = queued_bytes(frame);
-        if (!can_fit(bytes)) {
-            return WriteResult::failure(StatusCode::resource_limit_exceeded,
-                                        "write queue capacity exceeded");
-        }
-        if (!channel_.try_send(boost::system::error_code{}, std::move(frame))) {
-            return WriteResult::failure(StatusCode::resource_limit_exceeded,
-                                        "write queue is closed or full");
-        }
-        queued_bytes_ += bytes;
-        return WriteResult::success();
+        return try_enqueue_frame(frame);
     }
 
     boost::asio::awaitable<WriteResult> enqueue(Frame frame)
@@ -102,7 +92,7 @@ class WriteQueue {
         }
 
         while (true) {
-            auto result = try_enqueue(std::move(frame));
+            auto result = try_enqueue_frame(frame);
             if (result.ok()) {
                 co_return result;
             }
@@ -160,6 +150,21 @@ class WriteQueue {
     }
 
   private:
+    [[nodiscard]] WriteResult try_enqueue_frame(Frame &frame)
+    {
+        const auto bytes = queued_bytes(frame);
+        if (!can_fit(bytes)) {
+            return WriteResult::failure(StatusCode::resource_limit_exceeded,
+                                        "write queue capacity exceeded");
+        }
+        if (!channel_.try_send(boost::system::error_code{}, std::move(frame))) {
+            return WriteResult::failure(StatusCode::resource_limit_exceeded,
+                                        "write queue is closed or full");
+        }
+        queued_bytes_ += bytes;
+        return WriteResult::success();
+    }
+
     [[nodiscard]] static std::size_t queued_bytes(const Frame &frame) noexcept
     {
         return frame_header_size + frame.payload.size();

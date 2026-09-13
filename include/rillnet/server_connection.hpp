@@ -60,9 +60,10 @@ class SessionContext {
 template <typename CodecType = PodCodec> class ServerConnection {
   public:
     ServerConnection(boost::asio::any_io_executor executor, std::unique_ptr<Transport> transport,
-                     const MessageRegistry<CodecType> &registry)
+                const MessageRegistry<CodecType> &registry,
+                WriteQueueLimits write_queue_limits = {})
         : executor_(std::move(executor)), transport_(std::move(transport)), registry_(registry),
-          write_queue_(executor_, *transport_)
+           write_queue_(executor_, *transport_, write_queue_limits)
     {
     }
 

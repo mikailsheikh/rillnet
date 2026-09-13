@@ -35,6 +35,11 @@ struct WriteResult {
     }
 };
 
+struct WriteQueueLimits {
+    std::size_t max_frames = (std::numeric_limits<std::size_t>::max)();
+    std::size_t max_bytes = (std::numeric_limits<std::size_t>::max)();
+};
+
 // Provides one coordinated write path per connection. Several operations may call enqueue()
 // concurrently (as coroutines interleaved on the same executor); frames are handed to the
 // underlying Transport strictly in the order they were enqueued, and the queue guarantees that no
@@ -51,39 +56,68 @@ class WriteQueue {
     // Effectively unbounded: large enough that enqueue() never blocks on capacity in practice.
     static constexpr std::size_t unbounded_capacity = (std::numeric_limits<std::size_t>::max)();
 
-    explicit WriteQueue(boost::asio::any_io_executor executor, Transport &transport,
-                        std::size_t capacity = unbounded_capacity)
-        : transport_(transport), channel_(std::move(executor), capacity)
+        explicit WriteQueue(boost::asio::any_io_executor executor, Transport &transport,
+                                                WriteQueueLimits limits = {})
+                : transport_(transport), limits_(limits),
+                    channel_(executor, limits.max_frames), space_channel_(std::move(executor),
+                                                                                                                                space_signal_capacity(limits))
     {
     }
+
+        explicit WriteQueue(boost::asio::any_io_executor executor, Transport &transport,
+                                                std::size_t max_frames)
+                : WriteQueue(std::move(executor), transport,
+                                         WriteQueueLimits{max_frames, unbounded_capacity})
+        {
+        }
 
     WriteQueue(const WriteQueue &) = delete;
     WriteQueue &operator=(const WriteQueue &) = delete;
 
     // Enqueues a frame for writing, preserving FIFO order relative to every other enqueue() call.
     // Returns once the frame has been accepted into the queue, which is not the same as having
-    // been written to the transport yet. Reports resource_limit_exceeded if the queue has been
-    // closed or a bounded capacity is full.
+    // been written to the transport yet. Reports resource_limit_exceeded if the queue is closed,
+    // the frame is too large, or a bounded capacity is full.
     [[nodiscard]] WriteResult try_enqueue(Frame frame)
     {
+        const auto bytes = queued_bytes(frame);
+        if (!can_fit(bytes)) {
+            return WriteResult::failure(StatusCode::resource_limit_exceeded,
+                                        "write queue capacity exceeded");
+        }
         if (!channel_.try_send(boost::system::error_code{}, std::move(frame))) {
             return WriteResult::failure(StatusCode::resource_limit_exceeded,
                                         "write queue is closed or full");
         }
+        queued_bytes_ += bytes;
         return WriteResult::success();
     }
 
     boost::asio::awaitable<WriteResult> enqueue(Frame frame)
     {
-        boost::system::error_code error;
-        co_await channel_.async_send(
-            boost::system::error_code{}, std::move(frame),
-            boost::asio::redirect_error(boost::asio::use_awaitable, error));
-
-        if (error) {
-            co_return WriteResult::failure(StatusCode::resource_limit_exceeded, error.message());
+        const auto bytes = queued_bytes(frame);
+        if (bytes > limits_.max_bytes || limits_.max_frames == 0) {
+            co_return WriteResult::failure(StatusCode::resource_limit_exceeded,
+                                            "write queue capacity exceeded");
         }
-        co_return WriteResult::success();
+
+        while (true) {
+            auto result = try_enqueue(std::move(frame));
+            if (result.ok()) {
+                co_return result;
+            }
+            if (closed_) {
+                co_return result;
+            }
+
+            boost::system::error_code error;
+            co_await space_channel_.async_receive(
+                boost::asio::redirect_error(boost::asio::use_awaitable, error));
+            if (error) {
+                co_return WriteResult::failure(StatusCode::resource_limit_exceeded,
+                                                error.message());
+            }
+        }
     }
 
     // Runs the write loop: repeatedly takes the next queued frame in FIFO order and writes it to
@@ -103,6 +137,9 @@ class WriteQueue {
                 co_return WriteResult::success();
             }
 
+            queued_bytes_ -= queued_bytes(frame);
+            (void)space_channel_.try_send(boost::system::error_code{});
+
             try {
                 const auto encoded = encode_frame(frame);
                 co_await transport_.write(encoded);
@@ -115,11 +152,39 @@ class WriteQueue {
 
     // Stops accepting new frames. Frames already queued are still delivered to run(), which then
     // returns once they have drained. Safe to call repeatedly and from within run() itself.
-    void close() noexcept { channel_.close(); }
+    void close() noexcept
+    {
+        closed_ = true;
+        channel_.close();
+        space_channel_.close();
+    }
 
   private:
+    [[nodiscard]] static std::size_t queued_bytes(const Frame &frame) noexcept
+    {
+        return frame_header_size + frame.payload.size();
+    }
+
+    [[nodiscard]] bool can_fit(std::size_t bytes) const noexcept
+    {
+        return !closed_ && limits_.max_frames != 0 && bytes <= limits_.max_bytes &&
+               queued_bytes_ <= limits_.max_bytes - bytes;
+    }
+
+    [[nodiscard]] static std::size_t space_signal_capacity(const WriteQueueLimits &limits) noexcept
+    {
+        if (limits.max_frames == unbounded_capacity || limits.max_frames == 0) {
+            return 1;
+        }
+        return limits.max_frames;
+    }
+
     Transport &transport_;
+    WriteQueueLimits limits_;
+    std::size_t queued_bytes_ = 0;
+    bool closed_ = false;
     boost::asio::experimental::channel<void(boost::system::error_code, Frame)> channel_;
+    boost::asio::experimental::channel<void(boost::system::error_code)> space_channel_;
 };
 
 } // namespace rillnet

@@ -76,6 +76,14 @@ Frame make_frame(std::uint64_t stream)
     return frame;
 }
 
+Frame make_frame(std::uint64_t stream, std::size_t payload_size)
+{
+    auto frame = make_frame(stream);
+    frame.payload.resize(payload_size);
+    frame.header.payload_size = static_cast<std::uint32_t>(payload_size);
+    return frame;
+}
+
 boost::asio::awaitable<void> enqueue_all(rillnet::WriteQueue &queue,
                                          std::vector<std::uint64_t> streams)
 {
@@ -138,6 +146,34 @@ TEST(WriteQueueTest, RunReturnsAfterCloseOnceQueueDrains)
     producer_future.get();
     EXPECT_TRUE(run_future.get().ok());
     EXPECT_EQ(transport.writes_.size(), 2U);
+}
+
+TEST(WriteQueueTest, RejectsFramesWhenFrameCapacityIsFull)
+{
+    boost::asio::io_context context;
+    RecordingTransport transport;
+    rillnet::WriteQueue queue(context.get_executor(), transport, {.max_frames = 1});
+
+    EXPECT_TRUE(queue.try_enqueue(make_frame(1)).ok());
+    const auto result = queue.try_enqueue(make_frame(3));
+
+    EXPECT_FALSE(result.ok());
+    EXPECT_EQ(result.status, StatusCode::resource_limit_exceeded);
+}
+
+TEST(WriteQueueTest, RejectsFramesWhenByteCapacityIsFull)
+{
+    boost::asio::io_context context;
+    RecordingTransport transport;
+    const auto frame_bytes = frame_header_size + 3;
+    rillnet::WriteQueue queue(context.get_executor(), transport,
+                              {.max_frames = 4, .max_bytes = frame_bytes});
+
+    EXPECT_TRUE(queue.try_enqueue(make_frame(1, 3)).ok());
+    const auto result = queue.try_enqueue(make_frame(3, 1));
+
+    EXPECT_FALSE(result.ok());
+    EXPECT_EQ(result.status, StatusCode::resource_limit_exceeded);
 }
 
 TEST(WriteQueueTest, TransportWriteFailureStopsRunAndReportsFailure)

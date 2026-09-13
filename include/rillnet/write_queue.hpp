@@ -56,20 +56,19 @@ class WriteQueue {
     // Effectively unbounded: large enough that enqueue() never blocks on capacity in practice.
     static constexpr std::size_t unbounded_capacity = (std::numeric_limits<std::size_t>::max)();
 
-        explicit WriteQueue(boost::asio::any_io_executor executor, Transport &transport,
-                                                WriteQueueLimits limits = {})
-                : transport_(transport), limits_(limits),
-                    channel_(executor, limits.max_frames), space_channel_(std::move(executor),
-                                                                                                                                space_signal_capacity(limits))
+    explicit WriteQueue(boost::asio::any_io_executor executor, Transport &transport,
+                        WriteQueueLimits limits = {})
+        : transport_(transport), limits_(limits), channel_(executor, limits.max_frames),
+          space_channel_(std::move(executor), space_signal_capacity(limits))
     {
     }
 
-        explicit WriteQueue(boost::asio::any_io_executor executor, Transport &transport,
-                                                std::size_t max_frames)
-                : WriteQueue(std::move(executor), transport,
-                                         WriteQueueLimits{max_frames, unbounded_capacity})
-        {
-        }
+    explicit WriteQueue(boost::asio::any_io_executor executor, Transport &transport,
+                        std::size_t max_frames)
+        : WriteQueue(std::move(executor), transport,
+                     WriteQueueLimits{max_frames, unbounded_capacity})
+    {
+    }
 
     WriteQueue(const WriteQueue &) = delete;
     WriteQueue &operator=(const WriteQueue &) = delete;
@@ -78,17 +77,14 @@ class WriteQueue {
     // Returns once the frame has been accepted into the queue, which is not the same as having
     // been written to the transport yet. Waits for bounded capacity to become available and
     // reports resource_limit_exceeded if the queue is closed or the frame is too large.
-    [[nodiscard]] WriteResult try_enqueue(Frame frame)
-    {
-        return try_enqueue_frame(frame);
-    }
+    [[nodiscard]] WriteResult try_enqueue(Frame frame) { return try_enqueue_frame(frame); }
 
     boost::asio::awaitable<WriteResult> enqueue(Frame frame)
     {
         const auto bytes = queued_bytes(frame);
         if (bytes > limits_.max_bytes || limits_.max_frames == 0) {
             co_return WriteResult::failure(StatusCode::resource_limit_exceeded,
-                                            "write queue capacity exceeded");
+                                           "write queue capacity exceeded");
         }
 
         while (true) {
@@ -105,7 +101,7 @@ class WriteQueue {
                 boost::asio::redirect_error(boost::asio::use_awaitable, error));
             if (error) {
                 co_return WriteResult::failure(StatusCode::resource_limit_exceeded,
-                                                error.message());
+                                               error.message());
             }
         }
     }

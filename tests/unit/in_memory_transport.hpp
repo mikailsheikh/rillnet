@@ -79,10 +79,9 @@ class DuplexTransport final : public rillnet::Transport {
     {
         auto first_endpoint = std::make_shared<Endpoint>(executor);
         auto second_endpoint = std::make_shared<Endpoint>(std::move(executor));
-        return {std::unique_ptr<DuplexTransport>(
-                    new DuplexTransport(first_endpoint, second_endpoint)),
-                std::unique_ptr<DuplexTransport>(
-                    new DuplexTransport(second_endpoint, first_endpoint))};
+        return {
+            std::unique_ptr<DuplexTransport>(new DuplexTransport(first_endpoint, second_endpoint)),
+            std::unique_ptr<DuplexTransport>(new DuplexTransport(second_endpoint, first_endpoint))};
     }
 
     boost::asio::awaitable<std::size_t> read(std::span<std::byte> buffer) override

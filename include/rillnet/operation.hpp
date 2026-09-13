@@ -14,8 +14,8 @@
 namespace rillnet {
 
 class CancellationError final : public std::exception {
-    public:
-        [[nodiscard]] const char *what() const noexcept override { return "operation cancelled"; }
+  public:
+    [[nodiscard]] const char *what() const noexcept override { return "operation cancelled"; }
 };
 
 class OperationResult {

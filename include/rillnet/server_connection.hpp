@@ -60,10 +60,10 @@ class SessionContext {
 template <typename CodecType = PodCodec> class ServerConnection {
   public:
     ServerConnection(boost::asio::any_io_executor executor, std::unique_ptr<Transport> transport,
-                const MessageRegistry<CodecType> &registry,
-                WriteQueueLimits write_queue_limits = {})
+                     const MessageRegistry<CodecType> &registry,
+                     WriteQueueLimits write_queue_limits = {})
         : executor_(std::move(executor)), transport_(std::move(transport)), registry_(registry),
-           write_queue_(executor_, *transport_, write_queue_limits)
+          write_queue_(executor_, *transport_, write_queue_limits)
     {
     }
 
@@ -82,9 +82,8 @@ template <typename CodecType = PodCodec> class ServerConnection {
 
         handlers_.insert_or_assign(
             *message_type,
-            [this, handler = std::move(handler)](Frame frame,
-                                                 std::shared_ptr<Operation> operation)
-                -> boost::asio::awaitable<void> {
+            [this, handler = std::move(handler)](
+                Frame frame, std::shared_ptr<Operation> operation) -> boost::asio::awaitable<void> {
                 const auto request = decode_message<Request>(registry_, frame);
                 if (!request.ok()) {
                     co_return;
@@ -186,7 +185,7 @@ template <typename CodecType = PodCodec> class ServerConnection {
     }
 
     boost::asio::awaitable<void> run_handler(RequestHandler handler, Frame frame,
-                                              std::shared_ptr<Operation> operation)
+                                             std::shared_ptr<Operation> operation)
     {
         try {
             co_await handler(std::move(frame), std::move(operation));

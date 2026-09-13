@@ -32,11 +32,11 @@ using rillnet::Frame;
 using rillnet::FrameDecoder;
 using rillnet::FrameFlags;
 using rillnet::FrameType;
+using rillnet::has_flag;
 using rillnet::MessageRegistry;
 using rillnet::ServerConnection;
 using rillnet::SessionContext;
 using rillnet::StreamId;
-using rillnet::has_flag;
 using rillnet::testing::InMemoryTransport;
 
 struct StartSimulation {
@@ -195,8 +195,8 @@ TEST(ServerConnectionTest, ExposesRemoteCancellationToOnlyTheMatchingHandler)
     std::size_t cancelled_handlers = 0;
 
     connection.handle<StartSimulation>(
-        [&cancelled_handlers](SessionContext &session,
-                              StartSimulation request) -> boost::asio::awaitable<SimulationStarted> {
+        [&cancelled_handlers](SessionContext &session, StartSimulation request)
+            -> boost::asio::awaitable<SimulationStarted> {
             co_await boost::asio::post(boost::asio::use_awaitable);
             if (session.is_cancelled()) {
                 ++cancelled_handlers;
